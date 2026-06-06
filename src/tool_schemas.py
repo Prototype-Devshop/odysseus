@@ -405,6 +405,20 @@ FUNCTION_TOOL_SCHEMAS = [
     {
         "type": "function",
         "function": {
+            "name": "list_media_models",
+            "description": "List configured and enabled media-generation models (image models) with their capabilities and which one is the default. Call this to discover available image models BEFORE generate_image — never guess model names like 'Stable Diffusion' or 'FLUX'.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "kind": {"type": "string", "enum": ["image", "video"], "description": "Media kind to list (default: image)"}
+                },
+                "required": []
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "ui_control",
             "description": "Control the user interface. Actions: toggle (turn tools on/off), open_panel (open a modal: documents/library, gallery, email, sessions, notes, memories/brain, skills, settings, cookbook), open_email_reply (open an email reply draft document; does NOT send), set_mode, switch_model, set_theme (presets: dark, light, midnight, paper, nord, monokai, gruvbox, dracula, cyberpunk, retrowave, forest, ocean, ume, copper, terminal, vaporwave, lavender, gpt, coffee, claude), create_theme (CREATE any custom theme with a name + colors object — pick distinctive, evocative hex colors that match the requested aesthetic, NOT generic defaults. The theme auto-applies after creation). When a user asks for ANY theme not in the preset list, ALWAYS use create_theme.",
             "parameters": {
@@ -1258,6 +1272,8 @@ def function_call_to_tool_block(name: str, arguments: str) -> Optional[ToolBlock
             content = action
     elif tool_type == "list_models":
         content = args.get("filter", "")
+    elif tool_type == "list_media_models":
+        content = args.get("kind", "")
     elif tool_type == "ui_control":
         action = args.get("action", "")
         name = args.get("name", "")

@@ -272,6 +272,7 @@ Suggest changes with explanations (for review/feedback requests).""",
 ```
 Generate an image. Line 1 = description, line 2 = model name, line 3 = WxH (e.g. 1024x1024), line 4 = quality.""",
 
+    "list_media_models": "- ```list_media_models``` — List configured, enabled image-generation models and which is the default. Optional line 1 = kind (image/video; default image). Call this when the user asks whether you can make images or what image models are available, BEFORE generate_image — never guess model names.",
     "chat_with_model": "- ```chat_with_model``` — Ask a DIFFERENT AI model and relay its answer. Line 1 = model name (or 'model@endpoint'), rest = your message. Use when the user says 'ask <model>', 'what does <model> think', or wants to compare/their answer from another model.",
     "ask_teacher": "- ```ask_teacher``` — Escalate a hard question to a more capable model. Line 1 = model name or 'auto', rest = the question. Use when stuck or need expert knowledge.",
     "list_models": "- ```list_models``` — Show all available AI models across all endpoints. Use when user asks what models are available.",
@@ -1026,7 +1027,7 @@ def _build_base_prompt(
         if not needs_admin:
             # At least strip the management section
             mgmt_tools = set(TOOL_SECTIONS.keys()) - set(ALWAYS_AVAILABLE) - {
-                "generate_image", "suggest_document",
+                "generate_image", "list_media_models", "suggest_document",
                 "chat_with_model", "ask_teacher", "list_models",
             }
             agent_prompt = _assemble_prompt(

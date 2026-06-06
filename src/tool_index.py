@@ -75,6 +75,7 @@ BUILTIN_TOOL_DESCRIPTIONS: Dict[str, str] = {
     "update_document": "Replace the entire active document content. ONLY for full rewrites (>50% changed). Do not use for small edits — use edit_document instead.",
     "suggest_document": "Suggest changes to the active document with explanations. For code review, proofreading, feedback requests.",
     "generate_image": "Generate an AI image from a text prompt. Specify model, size, and quality. Art, illustrations, photos.",
+    "list_media_models": "List configured and enabled media generation models (image models) and their capabilities, including which is the default. Use to discover available image models before generating — e.g. 'can you make images?', 'what image models are available?'. Avoids guessing unconfigured model names.",
     "chat_with_model": "Send a message to a different AI model. Compare responses, get specialized help, delegate tasks.",
     "ask_teacher": "Ask a more capable model for help with a difficult problem. Escalate complex tasks.",
     "pipeline": "Run a multi-step AI pipeline with multiple models. Chain tasks together in sequence.",
@@ -431,6 +432,15 @@ class ToolIndex:
         frozenset({"write a", "create a doc", "draft", "compose", "poem", "story",
                    "essay", "outline", "letter"}):
             {"create_document", "edit_document", "update_document"},
+        # Image / media generation discovery + creation intent. Surfaces the
+        # discovery tool alongside generate_image so "can you make images?" /
+        # "what image models are available?" resolve available models instead
+        # of the agent guessing an unconfigured model name.
+        frozenset({"image", "images", "picture", "pictures", "photo", "art",
+                   "illustration", "draw", "render", "make an image",
+                   "generate an image", "create an image", "image model",
+                   "image models", "media models", "make images", "can you make"}):
+            {"list_media_models", "generate_image"},
     }
 
     def get_tools_for_query(

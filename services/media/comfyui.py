@@ -36,8 +36,13 @@ the probe path that answered).
 
 from __future__ import annotations
 
+import copy
+import json
 import logging
-from typing import Any, Dict, Optional, Tuple
+import random
+import time
+from pathlib import Path
+from typing import Any, Callable, Dict, Optional, Tuple
 
 import httpx
 
@@ -51,12 +56,126 @@ PROVIDER_TYPE = "comfyui"
 PROBE_PRIMARY_PATH = "/system_stats"
 PROBE_FALLBACK_PATH = "/object_info"
 
+# Generation API paths (OQ-3): queue a workflow, poll its history, fetch output.
+QUEUE_PATH = "/prompt"
+HISTORY_PATH = "/history"
+VIEW_PATH = "/view"
+
 # Bounded per-request timeout (seconds). Worst case is two sequential probes
 # (primary + fallback), i.e. ~2x this — still well under interactive limits.
 DEFAULT_PROBE_TIMEOUT = 5.0
 
+# Per-HTTP-call timeout for generation requests (queue / history / view).
+REQUEST_TIMEOUT = 30.0
+
+# Bounded polling for a generation job (OQ-8): overall wall-clock budget and
+# the interval between /history polls.
+DEFAULT_GENERATE_TIMEOUT = 120.0
+POLL_INTERVAL = 1.5
+
+# Workflow substitution placeholders. The bundled template carries these exact
+# tokens; substitution only replaces input values that equal one of them, so a
+# malicious/edited workflow cannot smuggle behavior through other fields.
+PH_PROMPT = "%prompt%"
+PH_NEGATIVE = "%negative_prompt%"
+PH_SEED = "%seed%"
+PH_WIDTH = "%width%"
+PH_HEIGHT = "%height%"
+PH_CHECKPOINT = "%checkpoint%"
+
+_DEFAULT_WORKFLOW_PATH = Path(__file__).resolve().parent / "workflows" / "text_to_image.json"
+
 # Suggested default endpoint surfaced in guidance (mirrors media_registry).
 SUGGESTED_ENDPOINT = media_registry.SUGGESTED_COMFYUI_ENDPOINT
+
+
+def _safe_progress(progress_cb: Optional[Callable[[str], Any]], message: str) -> None:
+    """Invoke a (sync) progress callback, never letting it break generation."""
+    if progress_cb is None:
+        return
+    try:
+        progress_cb(message)
+    except Exception:  # pragma: no cover - progress is best-effort
+        pass
+
+
+def apply_workflow_params(
+    workflow: Dict[str, Any],
+    *,
+    prompt: str,
+    seed: int,
+    width: int,
+    height: int,
+    negative_prompt: str = "",
+    checkpoint: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Return a copy of ``workflow`` with known placeholder tokens substituted.
+
+    SECURITY: the workflow is treated as untrusted data. We deep-copy it and
+    replace ONLY node-``inputs`` values that exactly equal one of the known
+    placeholder tokens. No node metadata is read or executed, and no other
+    field is touched — so an edited/hostile workflow cannot inject behavior
+    via this path.
+    """
+    subs: Dict[str, Any] = {
+        PH_PROMPT: prompt,
+        PH_NEGATIVE: negative_prompt,
+        PH_SEED: int(seed),
+        PH_WIDTH: int(width),
+        PH_HEIGHT: int(height),
+    }
+    if checkpoint:
+        subs[PH_CHECKPOINT] = checkpoint
+
+    wf = copy.deepcopy(workflow)
+    for node in wf.values():
+        if not isinstance(node, dict):
+            continue
+        inputs = node.get("inputs")
+        if not isinstance(inputs, dict):
+            continue
+        for key, value in list(inputs.items()):
+            if isinstance(value, str) and value in subs:
+                inputs[key] = subs[value]
+    return wf
+
+
+def _first_image_output(history_entry: Dict[str, Any]) -> Optional[Dict[str, str]]:
+    """Extract the first produced image reference from a ComfyUI history entry.
+
+    Returns ``{filename, subfolder, type}`` suitable as /view query params, or
+    None. The filename is only forwarded back to the same ComfyUI /view
+    endpoint — it is never used to write a local path here.
+    """
+    if not isinstance(history_entry, dict):
+        return None
+    outputs = history_entry.get("outputs")
+    if not isinstance(outputs, dict):
+        return None
+    for node in outputs.values():
+        if not isinstance(node, dict):
+            continue
+        images = node.get("images")
+        if isinstance(images, list) and images:
+            first = images[0]
+            if isinstance(first, dict) and first.get("filename"):
+                return {
+                    "filename": first.get("filename"),
+                    "subfolder": first.get("subfolder", ""),
+                    "type": first.get("type", "output"),
+                }
+    return None
+
+
+def _load_default_workflow() -> Optional[Dict[str, Any]]:
+    """Load the bundled text-to-image workflow template as plain data."""
+    try:
+        with open(_DEFAULT_WORKFLOW_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else None
+    except (OSError, json.JSONDecodeError) as e:  # pragma: no cover - packaging issue
+        logger.warning("comfyui: could not load bundled workflow: %s", e)
+        return None
 
 
 class ComfyUIProvider:
@@ -156,6 +275,129 @@ class ComfyUIProvider:
 
         last_code = code2 if code2 is not None else code
         return self._unavailable(last_code=last_code)
+
+    # ── Generation (queue → poll → retrieve) ──
+
+    def generate(
+        self,
+        *,
+        prompt: str,
+        width: int = 1024,
+        height: int = 1024,
+        seed: Optional[int] = None,
+        negative_prompt: str = "",
+        checkpoint: Optional[str] = None,
+        workflow: Optional[Dict[str, Any]] = None,
+        progress_cb: Optional[Callable[[str], Any]] = None,
+        timeout: float = DEFAULT_GENERATE_TIMEOUT,
+        poll_interval: float = POLL_INTERVAL,
+    ) -> Dict[str, Any]:
+        """Run a text-to-image job and return the raw image bytes.
+
+        Synchronous (uses httpx.post/get + time.sleep); callers on the event
+        loop should invoke via ``asyncio.to_thread``. Returns either a success
+        dict ``{"ok": True, "image_bytes": ..., "content_type": ..., ...}`` or a
+        degraded/error dict in the shared shape (``ok=False``). Persistence and
+        gallery/metadata are the caller's responsibility — this stays isolated
+        from the DB / filesystem.
+        """
+        endpoint = self.endpoint_url
+        if not endpoint:
+            return self._not_configured()
+        base = endpoint.rstrip("/")
+
+        if seed is None:
+            seed = random.randint(0, 2_147_483_647)
+
+        wf = workflow if workflow is not None else _load_default_workflow()
+        if not isinstance(wf, dict) or not wf:
+            return self._workflow_missing()
+        wf = apply_workflow_params(
+            wf, prompt=prompt, seed=seed, width=width, height=height,
+            negative_prompt=negative_prompt, checkpoint=checkpoint,
+        )
+
+        # 1) Queue the workflow.
+        _safe_progress(progress_cb, "Submitting image job to ComfyUI…")
+        try:
+            resp = httpx.post(base + QUEUE_PATH, json={"prompt": wf}, timeout=REQUEST_TIMEOUT)
+        except (httpx.RequestError, OSError) as e:
+            return self._unreachable(detail=str(e))
+        code = getattr(resp, "status_code", None)
+        if code in (401, 403):
+            return self._auth_error(code)
+        if isinstance(code, int) and not (200 <= code < 300):
+            return self._generation_failed(detail=f"queue request returned HTTP {code}")
+        try:
+            qdata = resp.json()
+        except Exception:
+            return self._generation_failed(detail="queue response was not valid JSON")
+        prompt_id = qdata.get("prompt_id") if isinstance(qdata, dict) else None
+        if not prompt_id:
+            return self._generation_failed(detail="ComfyUI did not return a prompt_id")
+
+        # 2) Poll history until the job appears (bounded wall-clock budget).
+        deadline = time.monotonic() + timeout
+        history_entry = None
+        while time.monotonic() < deadline:
+            _safe_progress(progress_cb, "Waiting for ComfyUI to finish…")
+            try:
+                hresp = httpx.get(f"{base}{HISTORY_PATH}/{prompt_id}", timeout=REQUEST_TIMEOUT)
+            except (httpx.RequestError, OSError) as e:
+                return self._unreachable(detail=str(e))
+            hcode = getattr(hresp, "status_code", None)
+            if isinstance(hcode, int) and 200 <= hcode < 300:
+                try:
+                    hdata = hresp.json()
+                except Exception:
+                    hdata = None
+                entry = hdata.get(prompt_id) if isinstance(hdata, dict) else None
+                if entry:
+                    history_entry = entry
+                    break
+            time.sleep(poll_interval)
+
+        if history_entry is None:
+            return self._timeout(timeout)
+
+        # 3) Locate and retrieve the produced image.
+        image_ref = _first_image_output(history_entry)
+        if not image_ref:
+            return self._generation_failed(detail="workflow produced no image output")
+
+        _safe_progress(progress_cb, "Retrieving generated image…")
+        try:
+            vresp = httpx.get(base + VIEW_PATH, params=image_ref, timeout=REQUEST_TIMEOUT)
+        except (httpx.RequestError, OSError) as e:
+            return self._unreachable(detail=str(e))
+        vcode = getattr(vresp, "status_code", None)
+        if not (isinstance(vcode, int) and 200 <= vcode < 300):
+            return self._generation_failed(detail=f"image retrieval returned HTTP {vcode}")
+        image_bytes = getattr(vresp, "content", b"") or b""
+        if not image_bytes:
+            return self._generation_failed(detail="ComfyUI returned an empty image")
+
+        content_type = "image/png"
+        headers = getattr(vresp, "headers", None)
+        if headers is not None:
+            try:
+                content_type = headers.get("content-type") or content_type
+            except Exception:
+                pass
+
+        return {
+            "ok": True,
+            "available": True,
+            "status": "generated",
+            "provider": PROVIDER_TYPE,
+            "endpoint": endpoint,
+            "prompt_id": prompt_id,
+            "seed": int(seed),
+            "width": int(width),
+            "height": int(height),
+            "image_bytes": image_bytes,
+            "content_type": content_type,
+        }
 
     # ── Result builders (shape-compatible with media_registry.degraded_state) ──
 
@@ -273,6 +515,60 @@ class ComfyUIProvider:
             ],
             detail=detail,
         )
+
+    def _generation_failed(self, *, detail: Optional[str]) -> Dict[str, Any]:
+        return self._result(
+            "generation_failed",
+            ok=False,
+            message=f"ComfyUI could not complete the image generation at {self.endpoint_url}.",
+            checked_status="generation failed",
+            next_steps=[
+                "Check the ComfyUI server logs for the failed prompt.",
+                "Confirm the configured workflow/checkpoint is installed in ComfyUI.",
+                "Try again.",
+            ],
+            detail=detail or None,
+        )
+
+    def _workflow_missing(self) -> Dict[str, Any]:
+        return self._result(
+            "workflow_missing",
+            ok=False,
+            message="No usable ComfyUI workflow template is available.",
+            checked_status="workflow missing",
+            next_steps=[
+                "Ensure the bundled text-to-image workflow template is present.",
+            ],
+        )
+
+    def _timeout(self, timeout: float) -> Dict[str, Any]:
+        return self._result(
+            "timeout",
+            ok=False,
+            message=(
+                f"ComfyUI did not finish the image within {int(timeout)}s at {self.endpoint_url}."
+            ),
+            checked_status="timeout",
+            next_steps=[
+                "The ComfyUI server may be overloaded or the workflow is slow.",
+                "Try again, or reduce image size.",
+            ],
+            detail=f"Polling exceeded the {int(timeout)}s budget.",
+        )
+
+
+def generate(
+    endpoint_url: Optional[str] = None,
+    *,
+    settings: Optional[Dict[str, Any]] = None,
+    **kwargs: Any,
+) -> Dict[str, Any]:
+    """Convenience: build a provider and run a generation job."""
+    if endpoint_url is not None:
+        provider = ComfyUIProvider(endpoint_url=endpoint_url)
+    else:
+        provider = ComfyUIProvider.from_settings(settings=settings)
+    return provider.generate(**kwargs)
 
 
 def probe(

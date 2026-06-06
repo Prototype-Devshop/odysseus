@@ -1616,7 +1616,137 @@ async def do_ui_control(content: str, session_id: Optional[str] = None, owner: O
 # Image generation
 # ---------------------------------------------------------------------------
 
-async def do_generate_image(content: str, session_id: Optional[str] = None, owner: Optional[str] = None) -> Dict:
+def _parse_size(size: str, default: Tuple[int, int] = (1024, 1024)) -> Tuple[int, int]:
+    """Parse a "WxH" size string into (width, height); fall back on default."""
+    try:
+        w, h = str(size).lower().split("x")
+        return int(w), int(h)
+    except Exception:
+        return default
+
+
+def _persist_generated_image(
+    image_bytes: bytes,
+    *,
+    prompt: str,
+    model: str,
+    size: str,
+    quality: str,
+    session_id: Optional[str] = None,
+    owner: Optional[str] = None,
+) -> Tuple[str, str]:
+    """Write generated image bytes to the gallery store; return (image_url, image_id)."""
+    from pathlib import Path
+    img_dir = Path("data/generated_images")
+    img_dir.mkdir(parents=True, exist_ok=True)
+    filename = f"{uuid.uuid4().hex[:12]}.png"
+    (img_dir / filename).write_bytes(image_bytes)
+    image_url = f"/api/generated-image/{filename}"
+    image_id = ""
+    try:
+        from src.database import SessionLocal, GalleryImage
+        new_id = str(uuid.uuid4())
+        db = SessionLocal()
+        db.add(GalleryImage(
+            id=new_id,
+            filename=filename,
+            prompt=prompt,
+            model=model,
+            size=size,
+            quality=quality,
+            session_id=session_id,
+            owner=owner,
+        ))
+        db.commit()
+        db.close()
+        image_id = new_id
+    except Exception as e:
+        logger.warning(f"Failed to save gallery record: {e}")
+    return image_url, image_id
+
+
+async def _generate_image_via_comfyui(
+    media_model: Dict,
+    *,
+    prompt: str,
+    size: str,
+    quality: str,
+    session_id: Optional[str] = None,
+    owner: Optional[str] = None,
+    progress_cb=None,
+) -> Dict:
+    """Generate an image via the ComfyUI provider and persist it.
+
+    Keeps the same return contract as ``do_generate_image`` (image_url /
+    image_id / image_prompt / image_model / image_size). The provider stays
+    isolated from the DB/filesystem; persistence happens here. Provider errors
+    are surfaced through the shared degraded-state message (no secrets/paths).
+    """
+    import asyncio
+    from src import media_registry
+    from services.media.comfyui import ComfyUIProvider
+
+    endpoint = (media_model.get("endpointUrl") or "").strip()
+    width, height = _parse_size(size)
+    provider = ComfyUIProvider(endpoint_url=endpoint)
+
+    # Bridge the async dict-style progress_cb to the (threaded) sync provider.
+    sync_progress = None
+    if progress_cb is not None:
+        try:
+            _loop = asyncio.get_running_loop()
+        except RuntimeError:
+            _loop = None
+
+        def sync_progress(msg: str):  # type: ignore[misc]
+            try:
+                res = progress_cb({"type": "progress", "message": msg})
+                if asyncio.iscoroutine(res) and _loop is not None:
+                    asyncio.run_coroutine_threadsafe(res, _loop)
+            except Exception:
+                pass
+
+    try:
+        result = await asyncio.to_thread(
+            provider.generate,
+            prompt=prompt,
+            width=width,
+            height=height,
+            progress_cb=sync_progress,
+        )
+    except Exception as e:
+        return {"error": f"ComfyUI generation error: {str(e)}"}
+
+    if not result.get("ok"):
+        return {"error": media_registry.format_degraded_message(result)}
+
+    image_bytes = result.get("image_bytes") or b""
+    if not image_bytes:
+        return {"error": "ComfyUI returned no image data."}
+
+    model_label = media_model.get("id") or media_model.get("label") or "comfyui"
+    out_size = f"{result.get('width', width)}x{result.get('height', height)}"
+    image_url, image_id = _persist_generated_image(
+        image_bytes,
+        prompt=prompt,
+        model=model_label,
+        size=out_size,
+        quality=quality,
+        session_id=session_id,
+        owner=owner,
+    )
+    return {
+        "results": f"Generated image for: {prompt[:100]}",
+        "image_url": image_url,
+        "image_id": image_id,
+        "image_prompt": prompt,
+        "image_model": model_label,
+        "image_size": out_size,
+        "image_quality": quality,
+    }
+
+
+async def do_generate_image(content: str, session_id: Optional[str] = None, owner: Optional[str] = None, progress_cb=None) -> Dict:
     """Generate an image using an image-capable model (e.g. gpt-image-1).
 
     Content format:
@@ -1645,11 +1775,49 @@ async def do_generate_image(content: str, session_id: Optional[str] = None, owne
     except Exception:
         _settings = {}
 
-    # Use admin-configured model/quality if not specified by the tool call
-    if not model_spec:
-        model_spec = _settings.get("image_model", "")
+    # Apply admin-configured quality default (the model default is applied only
+    # AFTER media-registry resolution below, so the registry default wins over a
+    # legacy image_model when no model is explicitly named).
     if quality == "medium" and _settings.get("image_quality"):
         quality = _settings["image_quality"]
+
+    # --- Media registry resolution (S4B) ---
+    # Resolution order (do not hardcode any model name):
+    #   1. explicit registry modelId (line 2 of content)
+    #   2. default registry image model (when no model was named)
+    #   3. legacy image_model / auto-detect path (below)
+    #   4. shared degraded-state response (below)
+    # ``model_spec`` here is the model named by the tool call (may be empty);
+    # the legacy ``image_model`` default has intentionally NOT been applied yet.
+    from src import media_registry
+    media_model = None
+    try:
+        if model_spec:
+            _candidate = media_registry.get_model(model_spec, owner=owner or "")
+            if _candidate and _candidate.get("enabled") and _candidate.get("kind") == "image":
+                media_model = _candidate
+        else:
+            media_model = media_registry.resolve_default_model(kind="image", owner=owner or "")
+    except Exception as _mre:
+        logger.warning(f"media registry resolution failed: {_mre}")
+        media_model = None
+
+    if media_model is not None and media_model.get("provider") == "comfyui":
+        return await _generate_image_via_comfyui(
+            media_model,
+            prompt=prompt,
+            size=size,
+            quality=quality,
+            session_id=session_id,
+            owner=owner,
+            progress_cb=progress_cb,
+        )
+    # Non-comfyui registry providers are not implemented yet; fall through to the
+    # legacy OpenAI-compatible path below (which leaves existing users working).
+
+    # Legacy default: admin-configured image_model when the tool named nothing.
+    if not model_spec:
+        model_spec = _settings.get("image_model", "")
 
     # Auto-detect best available image model if still not set
     if not model_spec:
@@ -1693,7 +1861,14 @@ async def do_generate_image(content: str, session_id: Optional[str] = None, owne
             except Exception:
                 pass
         if not model_spec:
-            return {"error": "No image model found. Configure one in Admin → Image Generation."}
+            _, _degraded = media_registry.default_image_model_or_degraded(owner=owner or "")
+            return {
+                "results": media_registry.format_degraded_message(_degraded),
+                "image_url": None,
+                "image_id": None,
+                "status": _degraded.get("status"),
+                "available": False,
+            }
 
     # Resolve the model to find the right endpoint
     try:

@@ -22,14 +22,14 @@
 | T3.3 | S3 | Return structured provider status; surface clear connection failures (reuse degraded-state shape) | Forge | done | Status dicts reuse `media_registry.degraded_state` shape (`online`/`not_configured`/`unreachable`/`auth_error`/`unavailable`) + `provider`/`endpoint`/`via` (AC-4, R5) |
 | T3.4 | S3 | Tests for probe: reachable, fallback success, unreachable/offline, malformed response | Forge/Verifier | done | `tests/test_comfyui_provider.py` (13 tests passing; httpx mocked per repo convention) |
 | T4.1 | S4A | Register `list_media_models` tool across schema/tags/index/parsing/dispatch | Forge | done | AC-2. Added to `TOOL_TAGS` (`agent_tools.py`), `FUNCTION_TOOL_SCHEMAS` + native arg map (`tool_schemas.py`), `_TOOL_NAME_MAP` (`tool_parsing.py`), `dispatch` group (`tool_execution.py`), `do_list_media_models` + dispatcher (`ai_interaction.py`), RAG description + image keyword hint (`tool_index.py`), `TOOL_SECTIONS` + non-admin keep-list (`agent_loop.py`). Reads via `media_registry`; public output omits `endpointUrl`/`workflowPath`; degraded-state reused when none configured. Tests: `tests/test_list_media_models_tool.py` (12). |
-| T4.2 | S4 | Adapt `generate_image` (`do_generate_image`, canonical owner-aware path) to resolve via registry (model ID or default), not hardcoded names; MCP server delegates | Forge | todo | AC-1, AC-5; OQ-5 resolved |
-| T4.3 | S4 | Provider-branched generation: submit ComfyUI job (`POST /prompt`), poll `GET /history/{id}` (≤120s, 1–2s interval, `progress_cb`), retrieve via `GET /view` | Forge | blocked | AC-6; needs reachable ComfyUI (D1) |
-| T4.4 | S4 | Workflow handling: load the single bundled workflow JSON as data; substitute known fields only (no arbitrary user workflows) | Forge | todo | OQ-4 resolved, R4 |
-| T4.5 | S4 | Degraded states: model disabled, workflow missing, generation failed (provider error preserved, no secrets/paths) | Forge | todo | AC-3, R4 |
-| T4.6 | S4 | Gatekeeper review (workflow/prompt injection, path/secret exposure) | Gatekeeper | todo | R4 |
-| T5.1 | S5 | Save ComfyUI output to gallery store (`data/generated_images/` + `gallery_images`); ensure owner/session set | Forge | todo | AC-7, R2 |
-| T5.2 | S5 | Store media metadata in existing gallery fields first; JSON sidecar beside the image if it does not fit (no new DB columns) | Forge | todo | AC-8; OQ-6 resolved |
-| T5.3 | S5 | Return asset/file reference to agent (keep `do_generate_image` return contract: `image_url`/`image_id`) | Forge | todo | AC-7, A5 |
+| T4.2 | S4B | Adapt `generate_image` (`do_generate_image`, canonical owner-aware path) to resolve via registry (model ID or default), not hardcoded names; MCP server delegates | Forge | done | AC-1, AC-5; OQ-5. Resolution order: explicit registry id → default registry image model → legacy `image_model`/auto-detect → shared degraded-state. `mcp_servers/image_gen_server.py` now delegates to `do_generate_image` |
+| T4.3 | S4B | Provider-branched generation: submit ComfyUI job (`POST /prompt`), poll `GET /history/{id}` (≤120s, 1–2s interval, `progress_cb`), retrieve via `GET /view` | Forge | done | AC-6. `ComfyUIProvider.generate()` (sync; run via `asyncio.to_thread`); bounded 120s poll @1.5s; async `progress_cb` bridged to sync shim. End-to-end against a live ComfyUI still pending (D1) |
+| T4.4 | S4B | Workflow handling: load the single bundled workflow JSON as data; substitute known fields only (no arbitrary user workflows) | Forge | done | OQ-4, R4. `services/media/workflows/text_to_image.json` (placeholder tokens); `apply_workflow_params` replaces only input values equal to a known token (deep-copied, metadata never read/executed) |
+| T4.5 | S4B | Degraded states: model disabled, workflow missing, generation failed (provider error preserved, no secrets/paths) | Forge | done | AC-3, R4. New builders `_generation_failed`/`_timeout`/`_workflow_missing` reuse `media_registry.degraded_state`; details carry HTTP status only (no bodies/paths) |
+| T4.6 | S4B | Gatekeeper review (workflow/prompt injection, path/secret exposure) | Gatekeeper | todo | R4 — pending review of S4B diff |
+| T5.1 | S4B | Save ComfyUI output to gallery store (`data/generated_images/` + `gallery_images`); ensure owner/session set | Forge | done | AC-7, R2. `_persist_generated_image` writes file + `GalleryImage` row with `session_id`/`owner` |
+| T5.2 | S5 | Store media metadata in existing gallery fields first; JSON sidecar beside the image if it does not fit (no new DB columns) | Forge | todo | AC-8; OQ-6 resolved (provider/seed sidecar deferred to S5) |
+| T5.3 | S4B | Return asset/file reference to agent (keep `do_generate_image` return contract: `image_url`/`image_id`) | Forge | done | AC-7, A5. ComfyUI path returns `image_url`/`image_id`/`image_prompt`/`image_model`/`image_size`/`image_quality` |
 | T6.1 | S6 | (If needed) Configure ComfyUI endpoint via existing settings patterns; no new visual styles | Forge | todo | AC-4; OQ-2 |
 | T6.2 | S6 | (If needed) Enable/disable model + select default image model in settings | Forge | todo | AC-5 |
 | T6.3 | S6 | (If needed) Minimal settings UI wiring, reusing existing components; `node --check` touched JS | Forge/Prism | todo | brief Slice 6 |
@@ -40,7 +40,7 @@
 
 | ID | Reason | Unblocker |
 |----|--------|-----------|
-| T4.3 | ComfyUI generation cannot be end-to-end verified without a reachable instance | A running ComfyUI endpoint available for testing (D1) |
+| T4.3 (live verify) | ComfyUI generation is implemented and unit-tested with mocked httpx, but a real queue→poll→retrieve round-trip is unverified | A running ComfyUI endpoint available for testing (D1) |
 
 > All open questions (OQ-1…OQ-9) were resolved on S2 kickoff; see [`open-questions.md`](open-questions.md). The remaining true blocker is environmental (a reachable ComfyUI instance for S4 generation verification).
 

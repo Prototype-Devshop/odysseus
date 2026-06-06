@@ -32,6 +32,16 @@ DEFAULT_SETTINGS = {
     "image_gen_enabled": True,
     "image_model": "",
     "image_quality": "medium",
+    # Media generation provider layer (image MVP; video later). See
+    # src/media_registry.py. `media_models` is a list of MediaModel dicts
+    # (id, label, provider, kind, capabilities, endpointUrl, workflowPath,
+    # enabled, isDefault, notes). `default_image_media_model` names the
+    # preferred image model id; `comfyui_endpoint_url` is the default ComfyUI
+    # endpoint used when a model entry omits its own endpointUrl. Empty values
+    # mean "not configured" and drive the degraded-state response.
+    "media_models": [],
+    "default_image_media_model": "",
+    "comfyui_endpoint_url": "",
     "vision_model": "",
     "vision_enabled": True,
     # Ordered fallback chain for the Vision model (image analysis, OCR, tagging).

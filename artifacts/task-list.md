@@ -12,23 +12,23 @@
 | T1.3 | S1 | Map model/provider config + probing + existing image gen (`core/database.py` `ModelEndpoint`, `src/settings.py`, `src/endpoint_resolver.py`, `src/ai_interaction.py` `_resolve_model`/`do_generate_image`, `mcp_servers/image_gen_server.py`, `scripts/diffusion_server.py`, `routes/model_routes.py` probes) | Architect | done | plan.md #3,#4,#5 |
 | T1.4 | S1 | Map asset storage + settings persistence + degraded-state patterns (`data/generated_images/` + `gallery_images`, `_save_to_gallery`, `GET /api/generated-image/{filename}`; `data/settings.json`/`src/settings.py`; `src/settings_scrub.py`; `core/database.py` `EncryptedText`) | Architect | done | plan.md #6,#7 |
 | T1.5 | S1 | Write `plan.md`, `task-list.md`, `open-questions.md` | Architect | done | this file |
-| T2.1 | S2 | Decide registry source of truth + backing store | Architect/Infra | blocked | OQ-1, OQ-2 |
-| T2.2 | S2 | Implement media model registry: register entry, list enabled image models | Forge | todo | depends on T2.1 |
-| T2.3 | S2 | Implement default image model resolution (and explicit deferral when default omitted) | Forge | todo | AC-5 |
-| T2.4 | S2 | Define shared degraded-state response shape; return structured no-default error | Forge | todo | AC-3, R5 |
-| T2.5 | S2 | Add tests/validation script for registry list + default resolution + no-default error | Forge/Verifier | todo | brief Slice 2 |
-| T3.1 | S3 | Create isolated ComfyUI provider module (config-driven, UI-isolated; `services/`-style per TTS/STT precedent) | Forge/Infra | blocked | OQ-2, OQ-3 |
+| T2.1 | S2 | Decide registry source of truth + backing store | Architect/Infra | done | OQ-1, OQ-2 resolved (hybrid registry; settings.json backing) |
+| T2.2 | S2 | Implement media model registry: register entry, list enabled image models | Forge | done | `src/media_registry.py` (`normalize_model`, `load_media_models`, `list_enabled_models`); keys added to `src/settings.py` `DEFAULT_SETTINGS` |
+| T2.3 | S2 | Implement default image model resolution (and explicit deferral when default omitted) | Forge | done | `src/media_registry.py` `resolve_default_model` (setting → isDefault → single-enabled) |
+| T2.4 | S2 | Define shared degraded-state response shape; return structured no-default error | Forge | done | `src/media_registry.py` `degraded_state`, `default_image_model_or_degraded`, `format_degraded_message` (AC-3, R5) |
+| T2.5 | S2 | Add tests/validation script for registry list + default resolution + no-default error | Forge/Verifier | done | `tests/test_media_registry.py` (23 tests passing) |
+| T3.1 | S3 | Create isolated ComfyUI provider module (config-driven, UI-isolated; `services/`-style per TTS/STT precedent) | Forge/Infra | todo | OQ-2, OQ-3 resolved |
 | T3.2 | S3 | Implement ComfyUI probe (accept endpoint URL; `httpx` + `verify=llm_verify()` + bounded timeout) | Forge | todo | AC-4; depends on T3.1 |
 | T3.3 | S3 | Return structured provider status; surface clear connection failures (reuse degraded-state shape) | Forge | todo | AC-4, R5 |
 | T3.4 | S3 | Tests for probe: reachable, unreachable/offline, malformed response | Forge/Verifier | todo | brief Slice 3 |
 | T4.1 | S4 | Register `list_media_models` tool across schema/tags/index/parsing/dispatch | Forge | todo | AC-2; plan.md #2 |
-| T4.2 | S4 | Adapt `generate_image` to resolve via registry (model ID or default), not hardcoded names | Forge | blocked | AC-1, AC-5; OQ-5 |
-| T4.3 | S4 | Provider-branched generation: submit ComfyUI job (`POST /prompt`), poll status, retrieve output (`/view`) | Forge | blocked | AC-6; OQ-3, OQ-4 |
-| T4.4 | S4 | Workflow handling: load workflow JSON as data; substitute prompt/params into known fields only | Forge | blocked | OQ-4, R4 |
+| T4.2 | S4 | Adapt `generate_image` (`do_generate_image`, canonical owner-aware path) to resolve via registry (model ID or default), not hardcoded names; MCP server delegates | Forge | todo | AC-1, AC-5; OQ-5 resolved |
+| T4.3 | S4 | Provider-branched generation: submit ComfyUI job (`POST /prompt`), poll `GET /history/{id}` (≤120s, 1–2s interval, `progress_cb`), retrieve via `GET /view` | Forge | blocked | AC-6; needs reachable ComfyUI (D1) |
+| T4.4 | S4 | Workflow handling: load the single bundled workflow JSON as data; substitute known fields only (no arbitrary user workflows) | Forge | todo | OQ-4 resolved, R4 |
 | T4.5 | S4 | Degraded states: model disabled, workflow missing, generation failed (provider error preserved, no secrets/paths) | Forge | todo | AC-3, R4 |
 | T4.6 | S4 | Gatekeeper review (workflow/prompt injection, path/secret exposure) | Gatekeeper | todo | R4 |
 | T5.1 | S5 | Save ComfyUI output to gallery store (`data/generated_images/` + `gallery_images`); ensure owner/session set | Forge | todo | AC-7, R2 |
-| T5.2 | S5 | Store basic media metadata (provider, workflow, seed, w/h, model label) or document nearest pattern | Forge | blocked | AC-8; OQ-6 |
+| T5.2 | S5 | Store media metadata in existing gallery fields first; JSON sidecar beside the image if it does not fit (no new DB columns) | Forge | todo | AC-8; OQ-6 resolved |
 | T5.3 | S5 | Return asset/file reference to agent (keep `do_generate_image` return contract: `image_url`/`image_id`) | Forge | todo | AC-7, A5 |
 | T6.1 | S6 | (If needed) Configure ComfyUI endpoint via existing settings patterns; no new visual styles | Forge | todo | AC-4; OQ-2 |
 | T6.2 | S6 | (If needed) Enable/disable model + select default image model in settings | Forge | todo | AC-5 |
@@ -40,12 +40,9 @@
 
 | ID | Reason | Unblocker |
 |----|--------|-----------|
-| T2.1 | Registry source of truth + backing store undecided | Resolve OQ-1 and OQ-2 |
-| T3.1 | ComfyUI config location + probe endpoint undecided | Resolve OQ-2 and OQ-3 |
-| T4.2 | Which entry path to adapt (MCP `image_gen_server` vs `ai_interaction.do_generate_image`) undecided | Resolve OQ-5 |
-| T4.3 | ComfyUI API surface unconfirmed | Resolve OQ-3 + ComfyUI instance available (D1) |
-| T4.4 | Baseline workflow JSON + substitutable fields unconfirmed | Resolve OQ-4 |
-| T5.2 | `gallery_images` may lack media-specific metadata columns | Resolve OQ-6 |
+| T4.3 | ComfyUI generation cannot be end-to-end verified without a reachable instance | A running ComfyUI endpoint available for testing (D1) |
+
+> All open questions (OQ-1…OQ-9) were resolved on S2 kickoff; see [`open-questions.md`](open-questions.md). The remaining true blocker is environmental (a reachable ComfyUI instance for S4 generation verification).
 
 ## Dependencies between tasks
 

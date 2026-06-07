@@ -89,6 +89,7 @@ _AGENT_RULES = """\
 - "Create/add/write a note" / "notes" / "todos" / "remind me to X at <time>" → use `manage_notes`. Do NOT store notes in `manage_memory`; memory is for persistent facts/preferences about the user, not note content. For reminders, include a `due_date`; for todos, use `note_type=checklist` when appropriate.
 - "Do X every morning / daily / on a schedule / automatically" (e.g. "summarize my inbox every morning") → this is a request to CREATE A SCHEDULED TASK, not to do X once right now. Call `manage_tasks` with action=create (prompt = what to do, schedule + cron/time). Do NOT just perform the action inline this turn — the user wants it to recur. After creating, return a clickable `[Task name](#task-<id>)` link and tell them it'll run on schedule and show in the Tasks panel. If you also want to show a sample of this run, do that AFTER creating the task, not instead of it.
 - "Can you make/draw/generate images?" / "Do you support image generation?" / "What image models are available?" → call ```list_media_models``` FIRST (it may already be pre-routed for you). There is no `draw`, `image_editing`, or invented image tool — never fabricate tool blocks. Answer only from the list_media_models result: if no models are configured, relay the degraded-state message; do not claim image generation works until the tool confirms models are available.
+- Concrete image requests ("generate/create an image of …", "draw a …", "make a picture of …") with no configured model → list_media_models may already be pre-routed. Image generation IS a tool here — do NOT say you cannot create images; relay the no-model degraded state and setup steps. Do not invent Stable Diffusion, sstablediff, draw, or image_editing.
 
 ## UI conventions
 - When you reference an entity by ID in your reply, render it as a STANDARD markdown link with a hash-prefixed anchor. The frontend converts these into clickable jump buttons:
@@ -132,6 +133,7 @@ _API_AGENT_RULES = """\
 - "Create/add/write a note" / "notes" / "todos" / "remind me to X at <time>" → use `manage_notes`. Do NOT store notes in `manage_memory`; memory is for persistent facts/preferences about the user, not note content. For reminders, include a `due_date`; for todos, use `note_type=checklist` when appropriate. `manage_tasks` is for RECURRING background AI jobs, NOT for one-off user reminders.
 - "Disable/turn off/enable/turn on <tool>" (shell, search, research, browser, documents, incognito, etc.) → call `ui_control` with `toggle <name> <on|off>`. Aliases accepted: shell→bash, search→web, deepresearch→research, documents→document_editor. NEVER record this as a memory — the user wants the toggle flipped, not a note about preferring it.
 - "Can you make/draw/generate images?" / "Do you support image generation?" / "What image models are available?" → call `list_media_models` FIRST (it may already be pre-routed for you). There is no `draw`, `image_editing`, or invented image tool — never fabricate tool calls. Answer only from the list_media_models result: if no models are configured, relay the degraded-state message; do not claim image generation works until the tool confirms models are available.
+- Concrete image requests ("generate/create an image of …", "draw a …", "make a picture of …") with no configured model → list_media_models may already be pre-routed. Image generation IS a tool here — do NOT say you cannot create images; relay the no-model degraded state and setup steps. Do not invent Stable Diffusion, sstablediff, draw, or image_editing.
 - "Research X" / "do research on X" / "look into Y" / "deep dive on Z" → call `trigger_research` with `topic`. This starts a live job that appears in the Deep Research sidebar (streams progress + final report). **Do NOT use `web_search` for these** — saw the agent do a plain web_search for "do research on X" when the user wanted the deep-research job. "research X" is a deep-research request, not a quick lookup. (web_search is only for a single quick fact mid-task.) Do NOT POST /api/research/start via app_api either — blocked. After starting, tell the user it's running in the Deep Research sidebar. Only if the user explicitly wants it inline/quick should you fall back to web_search.
 - "Open/show <panel>" (documents, library, gallery, email, inbox, sessions, brain/memories, skills, settings, notes, cookbook) → call `ui_control` with `open_panel <name>`. Panel aliases: library/doc/docs/document→documents, images→gallery, mail/inbox/emails→email, chats/history→sessions, memory/memories→brain, preferences→settings, models/serve/serving→cookbook. CRITICAL: "open memory/memories/brain" / "open skills" / "open notes" / "open documents" / "open cookbook" means OPEN THE PANEL — call `ui_control`, NOT a manage/list tool. The "manage_*" tools list contents in chat; `ui_control open_panel` opens the visual modal the user is asking for.
 - "Open/start a reply", "open a reply to <sender>", "draft a reply window" for email → find/read the email if needed, then call `ui_control` with `open_email_reply <uid> <folder> reply`. This opens the same email document compose window as clicking Reply in the Email UI. Do NOT call `reply_to_email` unless the user explicitly gave body text and wants to SEND immediately.
@@ -1757,18 +1759,21 @@ async def stream_agent_loop(
     # Strip internal metadata keys before sending to the LLM API
     messages = [{k: v for k, v in msg.items() if k != "_protected"} for msg in messages]
 
-    # Deterministic pre-route: image-capability questions call list_media_models
-    # before the model can hallucinate draw/image_editing tool blocks.
-    _image_capability_prerouted = False
+    # Deterministic pre-route: image-capability questions and unconfigured
+    # concrete creation prompts call list_media_models before the model can
+    # hallucinate draw/image_editing blocks or claim it cannot create images.
+    _image_discovery_prerouted = False
     if (
         not guide_only
         and not plan_mode
         and _last_user
+        and get_setting("image_gen_enabled", True)
         and "list_media_models" not in disabled_tools
         and not (tool_policy and tool_policy.blocks("list_media_models"))
     ):
-        from src.tool_index import is_image_capability_question
-        if is_image_capability_question(_last_user):
+        from src.tool_index import should_preroute_image_discovery
+        _preroute_kind = should_preroute_image_discovery(_last_user, owner=owner or "")
+        if _preroute_kind:
             try:
                 from src.ai_interaction import dispatch_ai_tool
                 desc, result = await dispatch_ai_tool(
@@ -1782,22 +1787,38 @@ async def stream_agent_loop(
                 yield (
                     f'data: {json.dumps({"type": "tool_output", "tool": "list_media_models", "command": "", "output": output_text, "exit_code": 0})}\n\n'
                 )
-                preroute_note = (
-                    "## list_media_models (pre-routed)\n"
-                    "The user asked whether image generation is available. "
-                    "This tool ran automatically before your response.\n\n"
-                    f"{formatted}\n\n"
-                    "Answer ONLY from this result. There is no `draw`, `image_editing`, "
-                    "`edit_image`, or other invented image tool — do not call or mention them. "
-                    "If no models are configured, relay the degraded-state message above."
-                )
+                if _preroute_kind == "capability":
+                    preroute_note = (
+                        "## list_media_models (pre-routed)\n"
+                        "The user asked whether image generation is available. "
+                        "This tool ran automatically before your response.\n\n"
+                        f"{formatted}\n\n"
+                        "Answer ONLY from this result. There is no `draw`, `image_editing`, "
+                        "`edit_image`, or other invented image tool — do not call or mention them. "
+                        "If no models are configured, relay the degraded-state message above."
+                    )
+                else:
+                    preroute_note = (
+                        "## list_media_models (pre-routed)\n"
+                        "The user asked to generate an image. No image model is configured yet, "
+                        "so this tool ran automatically before your response.\n\n"
+                        f"{formatted}\n\n"
+                        "Image generation IS available as a tool in this app — do NOT say you "
+                        "cannot create images. Relay the degraded-state message and setup "
+                        "guidance above. There is no `draw`, `image_editing`, `edit_image`, "
+                        "Stable Diffusion, sstablediff, or other invented provider/tool — do not "
+                        "call or mention them."
+                    )
                 inject = untrusted_context_message("tool_result", preroute_note)
                 messages.insert(_index_of_last_user_message(messages), inject)
                 disabled_tools.update({"generate_image", "edit_image"})
-                _image_capability_prerouted = True
-                logger.info("[image-capability] pre-routed list_media_models before model response")
+                _image_discovery_prerouted = True
+                logger.info(
+                    "[image-discovery] pre-routed list_media_models (%s) before model response",
+                    _preroute_kind,
+                )
             except Exception as e:
-                logger.warning("[image-capability] pre-route failed (non-fatal): %s", e)
+                logger.warning("[image-discovery] pre-route failed (non-fatal): %s", e)
 
     yield f"data: {json.dumps({'type': 'agent_prep', 'data': {k: round(v, 3) for k, v in prep_timings.items()}})}\n\n"
 
@@ -1821,7 +1842,7 @@ async def stream_agent_loop(
     backend_prefill_tps = 0  # backend-reported prefill speed
     requested_model = model
     actual_model = model
-    total_tool_calls = 1 if _image_capability_prerouted else 0  # budget enforcement
+    total_tool_calls = 1 if _image_discovery_prerouted else 0  # budget enforcement
 
     # Loop-breaker state. Small models (e.g. deepseek-v4-flash) can get
     # stuck firing the same tool call over and over with no text — burns

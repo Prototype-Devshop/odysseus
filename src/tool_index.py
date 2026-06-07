@@ -176,6 +176,15 @@ _IMAGE_CREATION_HINTS = frozenset({
     "generate an image", "create an image", "image model",
     "image models", "media models", "draw a", "draw me",
 })
+# Concrete text-to-image requests (distinct from capability questions).
+_IMAGE_CREATION_PROMPT_HINTS = frozenset({
+    "generate an image of", "generate an image",
+    "create an image of", "create an image",
+    "make a picture of", "make a picture",
+    "make an image of", "make an image",
+    "draw a", "draw me", "draw an",
+    "paint a", "paint me",
+})
 
 # Tools that must NOT appear for image-capability questions. Includes names
 # models hallucinate (draw, image_editing) even though they are not registered.
@@ -192,6 +201,41 @@ def is_image_capability_question(query: object) -> bool:
     return any(
         re.search(rf"\b{re.escape(kw)}\b", ql) for kw in _IMAGE_CAPABILITY_HINTS
     )
+
+
+def is_concrete_image_creation_prompt(query: object) -> bool:
+    """True for direct text-to-image requests (not capability questions)."""
+    if not isinstance(query, str) or not query.strip():
+        return False
+    if is_image_capability_question(query):
+        return False
+    ql = query.lower()
+    return any(
+        re.search(rf"\b{re.escape(kw)}\b", ql) for kw in _IMAGE_CREATION_PROMPT_HINTS
+    )
+
+
+def should_preroute_image_discovery(
+    query: object,
+    *,
+    owner: str = "",
+    settings: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
+    """Return ``'capability'``, ``'creation'``, or ``None`` for pre-routing.
+
+    Capability questions always pre-route. Concrete creation prompts pre-route
+    only when no media model and no legacy/endpoint fallback is configured.
+    """
+    if not isinstance(query, str) or not query.strip():
+        return None
+    if is_image_capability_question(query):
+        return "capability"
+    if is_concrete_image_creation_prompt(query):
+        from src import media_registry
+
+        if not media_registry.image_generation_routable(owner=owner, settings=settings):
+            return "creation"
+    return None
 
 
 def apply_image_capability_tool_selection(tools: Set[str], query: object) -> Set[str]:

@@ -244,6 +244,20 @@ def test_to_public_dict_omits_internal_paths():
     assert pub["capabilities"] == ["text-to-image", "image-edit"]
 
 
+def test_image_generation_routable_false_when_no_models_or_legacy():
+    assert mr.image_generation_routable(settings=_settings([])) is False
+
+
+def test_image_generation_routable_true_with_default_media_model():
+    cfg = _settings([_comfy_image(isDefault=True)])
+    assert mr.image_generation_routable(settings=cfg) is True
+
+
+def test_image_generation_routable_true_with_legacy_image_model():
+    cfg = _settings([], image_model="gpt-image-1")
+    assert mr.image_generation_routable(settings=cfg) is True
+
+
 def test_format_degraded_message_renders_block():
     _, degraded = mr.default_image_model_or_degraded(settings=_settings([]))
     text = mr.format_degraded_message(degraded)

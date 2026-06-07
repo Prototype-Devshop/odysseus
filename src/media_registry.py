@@ -368,6 +368,43 @@ def default_image_model_or_degraded(
     )
 
 
+def image_generation_routable(
+    owner: str = "", settings: Optional[Dict[str, Any]] = None
+) -> bool:
+    """True when ``generate_image`` has a configured path (no network probing).
+
+    Matches the pre-route gate for concrete creation prompts:
+      1. resolvable default media-registry image model, or
+      2. legacy ``image_model`` setting, or
+      3. at least one enabled image-type ``ModelEndpoint`` in the DB.
+    """
+    cfg = _load_settings(settings)
+    if resolve_default_model(kind="image", owner=owner, settings=cfg) is not None:
+        return True
+    legacy = cfg.get("image_model")
+    if isinstance(legacy, str) and legacy.strip():
+        return True
+    try:
+        from src.database import SessionLocal, ModelEndpoint
+        from src.auth_helpers import owner_filter
+
+        db = SessionLocal()
+        try:
+            q = db.query(ModelEndpoint).filter(
+                ModelEndpoint.is_enabled == True,
+                ModelEndpoint.model_type == "image",
+            )
+            if owner:
+                q = owner_filter(q, ModelEndpoint, owner)
+            if q.first() is not None:
+                return True
+        finally:
+            db.close()
+    except Exception:
+        pass
+    return False
+
+
 # ── Presentation helpers ──
 
 def to_public_dict(model: Dict[str, Any]) -> Dict[str, Any]:

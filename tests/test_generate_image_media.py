@@ -350,3 +350,129 @@ async def test_legacy_openai_path_still_works(monkeypatch, tmp_path):
 
     assert result.get("image_url", "").startswith("/api/generated-image/")
     assert result.get("image_model") == "gpt-image-1"
+
+
+# 7. Gallery persistence session_id hardening --------------------------------
+
+def _patch_gallery_db(monkeypatch):
+    import importlib
+
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+
+    from tests.helpers.import_state import clear_fake_database_modules
+
+    clear_fake_database_modules()
+    import core.database as cdb
+    import src.database as db_mod
+    importlib.reload(cdb)
+    importlib.reload(db_mod)
+
+    from core.database import Base
+
+    engine = create_engine(
+        "sqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+    )
+    Base.metadata.create_all(engine)
+    session_local = sessionmaker(bind=engine)
+    monkeypatch.setattr(cdb, "SessionLocal", session_local)
+    monkeypatch.setattr(db_mod, "SessionLocal", session_local)
+    return session_local
+
+
+def _seed_session(session_local, session_id="sess-valid"):
+    from core.database import Session
+
+    db = session_local()
+    try:
+        db.add(Session(
+            id=session_id,
+            name="Test",
+            endpoint_url="http://localhost:8000",
+            model="test-model",
+        ))
+        db.commit()
+    finally:
+        db.close()
+
+
+def test_persist_generated_image_none_session_id(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    session_local = _patch_gallery_db(monkeypatch)
+
+    image_url, image_id = ai_interaction._persist_generated_image(
+        b"PNGDATA",
+        prompt="a bike",
+        model="comfyui",
+        size="512x512",
+        quality="medium",
+        session_id=None,
+    )
+
+    assert image_id
+    assert image_url.startswith("/api/generated-image/")
+    from core.database import GalleryImage
+
+    db = session_local()
+    try:
+        row = db.query(GalleryImage).filter(GalleryImage.id == image_id).one()
+        assert row.session_id is None
+    finally:
+        db.close()
+    assert (tmp_path / "data" / "generated_images").exists()
+
+
+def test_persist_generated_image_valid_session_id(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    session_local = _patch_gallery_db(monkeypatch)
+    _seed_session(session_local, "sess-valid")
+
+    image_url, image_id = ai_interaction._persist_generated_image(
+        b"PNGDATA",
+        prompt="a bike",
+        model="comfyui",
+        size="512x512",
+        quality="medium",
+        session_id="sess-valid",
+        owner="alice",
+    )
+
+    assert image_id
+    from core.database import GalleryImage
+
+    db = session_local()
+    try:
+        row = db.query(GalleryImage).filter(GalleryImage.id == image_id).one()
+        assert row.session_id == "sess-valid"
+        assert row.owner == "alice"
+    finally:
+        db.close()
+    assert (tmp_path / "data" / "generated_images").exists()
+
+
+def test_persist_generated_image_invalid_session_id_falls_back(tmp_path, monkeypatch, caplog):
+    monkeypatch.chdir(tmp_path)
+    session_local = _patch_gallery_db(monkeypatch)
+
+    image_url, image_id = ai_interaction._persist_generated_image(
+        b"PNGDATA",
+        prompt="a bike",
+        model="comfyui",
+        size="512x512",
+        quality="medium",
+        session_id="manual-live-test",
+    )
+
+    assert image_id
+    assert image_url.startswith("/api/generated-image/")
+    from core.database import GalleryImage
+
+    db = session_local()
+    try:
+        row = db.query(GalleryImage).filter(GalleryImage.id == image_id).one()
+        assert row.session_id is None
+    finally:
+        db.close()
+    assert "manual-live-test" in caplog.text
+    assert (tmp_path / "data" / "generated_images").exists()

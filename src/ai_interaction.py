@@ -1625,6 +1625,42 @@ def _parse_size(size: str, default: Tuple[int, int] = (1024, 1024)) -> Tuple[int
         return default
 
 
+def _resolve_gallery_session_id(session_id: Optional[str]) -> Optional[str]:
+    """Return a session id safe for GalleryImage FK, or None when unlinked.
+
+    ``None``/empty passes through. A nonexistent id is downgraded to ``None``
+    so gallery persistence does not fail on manual or stale session ids.
+    """
+    if not session_id or not str(session_id).strip():
+        return None
+    session_id = str(session_id).strip()
+    try:
+        from src.database import SessionLocal, Session
+
+        db = SessionLocal()
+        try:
+            exists = (
+                db.query(Session.id).filter(Session.id == session_id).first()
+                is not None
+            )
+        finally:
+            db.close()
+        if exists:
+            return session_id
+        logger.warning(
+            "Gallery persistence: session_id %r not found; saving without session link",
+            session_id,
+        )
+        return None
+    except Exception as e:
+        logger.warning(
+            "Gallery persistence: could not validate session_id %r: %s",
+            session_id,
+            e,
+        )
+        return None
+
+
 def _persist_generated_image(
     image_bytes: bytes,
     *,
@@ -1643,6 +1679,7 @@ def _persist_generated_image(
     (img_dir / filename).write_bytes(image_bytes)
     image_url = f"/api/generated-image/{filename}"
     image_id = ""
+    gallery_session_id = _resolve_gallery_session_id(session_id)
     try:
         from src.database import SessionLocal, GalleryImage
         new_id = str(uuid.uuid4())
@@ -1654,7 +1691,7 @@ def _persist_generated_image(
             model=model,
             size=size,
             quality=quality,
-            session_id=session_id,
+            session_id=gallery_session_id,
             owner=owner,
         ))
         db.commit()
@@ -1959,7 +1996,7 @@ async def do_generate_image(content: str, session_id: Optional[str] = None, owne
                         model=model_id,
                         size=size,
                         quality=payload.get("quality", "medium"),
-                        session_id=session_id,
+                        session_id=_resolve_gallery_session_id(session_id),
                         owner=owner,
                     ))
                     _gdb.commit()

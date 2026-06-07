@@ -12,7 +12,13 @@ These hints are deterministic string matching — no embeddings — so we can te
 `get_tools_for_query` directly with retrieval stubbed out (no ChromaDB needed).
 """
 
-from src.tool_index import ToolIndex, ALWAYS_AVAILABLE
+from src.tool_index import (
+    ToolIndex,
+    ALWAYS_AVAILABLE,
+    IMAGE_CAPABILITY_FORBIDDEN_TOOLS,
+    apply_image_capability_tool_selection,
+    is_image_capability_question,
+)
 
 _EMAIL_TOOLS = {
     "list_emails", "read_email", "send_email", "reply_to_email",
@@ -74,8 +80,31 @@ def test_image_capability_queries_surface_list_media_models_only():
     for q in _CAPABILITY_QUERIES:
         tools = ti.get_tools_for_query(q)
         assert "list_media_models" in tools, q
-        assert "generate_image" not in tools, q
-        assert "draw" not in tools, q
+        leaked = IMAGE_CAPABILITY_FORBIDDEN_TOOLS & tools
+        assert not leaked, f"{q} must not surface {sorted(leaked)}"
+
+
+def test_is_image_capability_question_detects_common_prompts():
+    for q in _CAPABILITY_QUERIES:
+        assert is_image_capability_question(q), q
+    assert not is_image_capability_question("draw a cat in watercolor")
+    assert not is_image_capability_question("tell me a joke")
+
+
+def test_image_capability_filter_strips_rag_retrieved_image_tools():
+    ti = ToolIndex.__new__(ToolIndex)
+    ti.retrieve = lambda query, k=8: [
+        "edit_image", "generate_image", "draw", "image_editing",
+    ]
+    tools = ti.get_tools_for_query("Can you make images?")
+    assert "list_media_models" in tools
+    leaked = IMAGE_CAPABILITY_FORBIDDEN_TOOLS & tools
+    assert not leaked
+
+
+def test_apply_image_capability_tool_selection_is_noop_for_creation():
+    base = {"list_media_models", "generate_image", "bash"}
+    assert apply_image_capability_tool_selection(base, "draw a red fox") == base
 
 
 def test_image_creation_intent_still_surfaces_generation_tools():

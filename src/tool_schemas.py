@@ -406,7 +406,7 @@ FUNCTION_TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "list_media_models",
-            "description": "List configured and enabled media-generation models (image models) with their capabilities and which one is the default. ALWAYS call this FIRST when the user asks whether you can make/draw/generate images or what image models are available. There is no separate 'draw' tool. Report the tool result — if no models are configured, relay the degraded-state message instead of claiming image generation works. Never guess model names like 'Stable Diffusion' or 'FLUX'.",
+            "description": "List configured and enabled media-generation models (image models) with their capabilities and which one is the default. ALWAYS call this FIRST when the user asks whether you can make/draw/generate images or what image models are available. There is no draw, image_editing, or invented image tool. Report the tool result — if no models are configured, relay the degraded-state message instead of claiming image generation works. Never guess model names like 'Stable Diffusion' or 'FLUX'.",
             "parameters": {
                 "type": "object",
                 "properties": {

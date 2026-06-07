@@ -105,7 +105,7 @@ BUILTIN_TOOL_DESCRIPTIONS: Dict[str, str] = {
     "update_document": "Replace the entire active document content. ONLY for full rewrites (>50% changed). Do not use for small edits — use edit_document instead.",
     "suggest_document": "Suggest changes to the active document with explanations. For code review, proofreading, feedback requests.",
     "generate_image": "Generate an AI image from a text prompt. Specify model, size, and quality. Art, illustrations, photos. There is no separate 'draw' tool — use generate_image for creation after list_media_models confirms a model is configured.",
-    "list_media_models": "List configured and enabled media generation models (image models) and their capabilities, including which is the default. ALWAYS call this FIRST when the user asks whether you can make/draw/generate images or what image models are available — e.g. 'can you make images?', 'can you draw?', 'do you support image generation?'. Report the tool result; if no models are configured, relay the degraded-state message. Never invent a 'draw' tool or guess model names like Stable Diffusion.",
+    "list_media_models": "List configured and enabled media generation models (image models) and their capabilities, including which is the default. ALWAYS call this FIRST when the user asks whether you can make/draw/generate images or what image models are available — e.g. 'can you make images?', 'can you draw?', 'do you support image generation?'. Report the tool result; if no models are configured, relay the degraded-state message. Never invent tools — there is no draw, image_editing, or separate editing tool for capability questions. Never guess model names like Stable Diffusion.",
     "chat_with_model": "Send a message to a different AI model. Compare responses, get specialized help, delegate tasks.",
     "ask_teacher": "Ask a more capable model for help with a difficult problem. Escalate complex tasks.",
     "pipeline": "Run a multi-step AI pipeline with multiple models. Chain tasks together in sequence.",
@@ -176,6 +176,31 @@ _IMAGE_CREATION_HINTS = frozenset({
     "generate an image", "create an image", "image model",
     "image models", "media models", "draw a", "draw me",
 })
+
+# Tools that must NOT appear for image-capability questions. Includes names
+# models hallucinate (draw, image_editing) even though they are not registered.
+IMAGE_CAPABILITY_FORBIDDEN_TOOLS = frozenset({
+    "generate_image", "edit_image", "draw", "image_editing",
+})
+
+
+def is_image_capability_question(query: object) -> bool:
+    """True when the user asks WHETHER image generation is available."""
+    if not isinstance(query, str) or not query.strip():
+        return False
+    ql = query.lower()
+    return any(
+        re.search(rf"\b{re.escape(kw)}\b", ql) for kw in _IMAGE_CAPABILITY_HINTS
+    )
+
+
+def apply_image_capability_tool_selection(tools: Set[str], query: object) -> Set[str]:
+    """Narrow tool selection for image-capability questions."""
+    if not is_image_capability_question(query):
+        return tools
+    narrowed = set(tools) - IMAGE_CAPABILITY_FORBIDDEN_TOOLS
+    narrowed.add("list_media_models")
+    return narrowed
 
 
 def keyword_hint_tools(query: str) -> Set[str]:
@@ -543,7 +568,7 @@ class ToolIndex:
         # the agent can actually create the cron job instead of fumbling.
         if self._SCHEDULE_RE.search((query or "").lower()):
             base.add("manage_tasks")
-        return base
+        return apply_image_capability_tool_selection(base, query)
 
 
 # ── Singleton ──

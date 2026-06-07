@@ -85,6 +85,8 @@ def test_tool_index_description_present():
 
 
 def test_keyword_hint_capability_queries_surface_discovery_only():
+    from src.tool_index import IMAGE_CAPABILITY_FORBIDDEN_TOOLS
+
     ti = ToolIndex.__new__(ToolIndex)
     ti.retrieve = lambda query, k=8: []
     for q in (
@@ -95,7 +97,8 @@ def test_keyword_hint_capability_queries_surface_discovery_only():
     ):
         tools = ti.get_tools_for_query(q)
         assert "list_media_models" in tools, q
-        assert "generate_image" not in tools, q
+        leaked = IMAGE_CAPABILITY_FORBIDDEN_TOOLS & tools
+        assert not leaked, f"{q} leaked {sorted(leaked)}"
 
 
 def test_keyword_hint_creation_intent_surfaces_both_tools():

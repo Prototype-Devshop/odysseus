@@ -10,7 +10,7 @@ import logging
 import hashlib
 import re
 import time
-from typing import Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set
 
 from src.embedding_lanes import (
     LANE_CUSTOM,

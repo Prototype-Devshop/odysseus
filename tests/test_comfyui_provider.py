@@ -398,11 +398,48 @@ def test_generate_times_out_when_history_never_ready(monkeypatch):
         raise AssertionError("should not fetch /view on timeout")
 
     _install_generation_router(monkeypatch, post=post, get=get)
-    # timeout=0 makes the polling budget elapse immediately.
-    result = ComfyUIProvider(ENDPOINT).generate(prompt="x", seed=1, timeout=0, poll_interval=0, checkpoint=CKPT)
+    ticks = iter([0.0, 100.0])
+    monkeypatch.setattr(comfyui.time, "monotonic", lambda: next(ticks))
+    result = ComfyUIProvider(ENDPOINT).generate(
+        prompt="x", seed=1, timeout=30, poll_interval=0, checkpoint=CKPT,
+    )
 
     assert result["ok"] is False
     assert result["status"] == "timeout"
+
+
+def test_coerce_generation_timeout_clamps_and_defaults():
+    assert comfyui.coerce_generation_timeout(None) == comfyui.DEFAULT_GENERATE_TIMEOUT
+    assert comfyui.coerce_generation_timeout(300) == 300.0
+    assert comfyui.coerce_generation_timeout(10) == comfyui.MIN_GENERATE_TIMEOUT
+    assert comfyui.coerce_generation_timeout(2000) == comfyui.MAX_GENERATE_TIMEOUT
+    assert comfyui.coerce_generation_timeout("not-a-number") == comfyui.DEFAULT_GENERATE_TIMEOUT
+
+
+def test_default_generate_timeout_is_slower_local_default():
+    assert comfyui.DEFAULT_GENERATE_TIMEOUT == 300.0
+
+
+def test_timeout_message_is_safe(monkeypatch):
+    def post(url, body):
+        return _FakeResp(200, {"prompt_id": "pid"})
+
+    def get(url, params):
+        if "/history/" in url:
+            return _FakeResp(200, {})
+        raise AssertionError("should not fetch /view on timeout")
+
+    _install_generation_router(monkeypatch, post=post, get=get)
+    ticks = iter([0.0, 500.0])
+    monkeypatch.setattr(comfyui.time, "monotonic", lambda: next(ticks))
+    result = ComfyUIProvider("http://10.9.9.9:8188").generate(
+        prompt="x", seed=1, timeout=120, poll_interval=0, checkpoint=CKPT,
+    )
+    text = media_registry.format_degraded_message(result)
+    assert result["status"] == "timeout"
+    assert "10.9.9.9" not in text
+    assert "8188" not in text
+    assert "120" in text
 
 
 def test_generate_no_image_in_output(monkeypatch):

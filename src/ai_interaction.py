@@ -1689,6 +1689,7 @@ async def _generate_image_via_comfyui(
     endpoint = (media_model.get("endpointUrl") or "").strip()
     checkpoint = (media_model.get("checkpoint") or "").strip() or None
     width, height = _parse_size(size)
+    gen_timeout = media_registry.resolve_generation_timeout(media_model)
     provider = ComfyUIProvider(endpoint_url=endpoint)
 
     # Bridge the async dict-style progress_cb to the (threaded) sync provider.
@@ -1715,6 +1716,7 @@ async def _generate_image_via_comfyui(
             height=height,
             checkpoint=checkpoint,
             progress_cb=sync_progress,
+            timeout=gen_timeout,
         )
     except Exception as e:
         # Keep the raw exception (may contain a URL/path) in logs only.
@@ -1768,6 +1770,13 @@ async def do_generate_image(content: str, session_id: Optional[str] = None, owne
     model_spec = lines[1].strip() if len(lines) > 1 and lines[1].strip() else ""
     size = lines[2].strip() if len(lines) > 2 and lines[2].strip() else "1024x1024"
     quality = lines[3].strip() if len(lines) > 3 and lines[3].strip() else "medium"
+
+    # Bare WxH on line 2 is a size, not a model id (common manual call pattern).
+    if model_spec and not (len(lines) > 2 and lines[2].strip()):
+        import re
+        if re.fullmatch(r"\d+x\d+", model_spec, flags=re.IGNORECASE):
+            size = model_spec
+            model_spec = ""
 
     if not prompt:
         return {"error": "Image prompt is required (line 1)"}

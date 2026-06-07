@@ -100,7 +100,10 @@ REQUEST_TIMEOUT = 30.0
 
 # Bounded polling for a generation job (OQ-8): overall wall-clock budget and
 # the interval between /history polls.
-DEFAULT_GENERATE_TIMEOUT = 120.0
+MIN_GENERATE_TIMEOUT = 30.0
+MAX_GENERATE_TIMEOUT = 900.0
+# Safer default for slow first-run machines (e.g. SD 1.5 on Apple Silicon).
+DEFAULT_GENERATE_TIMEOUT = 300.0
 POLL_INTERVAL = 1.5
 
 # Workflow substitution placeholders. The bundled template carries these exact
@@ -122,6 +125,21 @@ SUGGESTED_ENDPOINT = media_registry.SUGGESTED_COMFYUI_ENDPOINT
 def _safe_err(e: BaseException) -> str:
     """A leak-safe description of an exception (type name only, no message/URL)."""
     return type(e).__name__
+
+
+def coerce_generation_timeout(
+    raw: Any,
+    *,
+    default: float = DEFAULT_GENERATE_TIMEOUT,
+) -> float:
+    """Clamp a generation poll budget to a safe bounded range (30–900s)."""
+    if raw is None or raw == "":
+        return float(default)
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return float(default)
+    return max(MIN_GENERATE_TIMEOUT, min(MAX_GENERATE_TIMEOUT, value))
 
 
 # Endpoint locality tiers (privacy boundary). These are deliberately distinct:
@@ -471,6 +489,7 @@ class ComfyUIProvider:
         if blocked is not None:
             return blocked
 
+        timeout = coerce_generation_timeout(timeout)
         base = endpoint.rstrip("/")
 
         if seed is None:

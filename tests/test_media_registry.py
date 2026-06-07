@@ -366,6 +366,42 @@ def test_registry_reads_from_settings_file(tmp_path, monkeypatch):
         s._invalidate_caches()
 
 
+def test_normalize_model_parses_generation_timeout():
+    m = mr.normalize_model(
+        {"id": "x", "generationTimeoutSeconds": 420},
+        settings=_settings([]),
+    )
+    assert m["generationTimeoutSeconds"] == 420.0
+
+
+def test_resolve_generation_timeout_prefers_model_over_global():
+    model = mr.normalize_model(
+        {"id": "x", "generationTimeoutSeconds": 450},
+        settings=_settings([]),
+    )
+    cfg = _settings([], comfyui_generation_timeout_seconds=300)
+    assert mr.resolve_generation_timeout(model, settings=cfg) == 450.0
+
+
+def test_resolve_generation_timeout_uses_global_setting():
+    cfg = _settings([], comfyui_generation_timeout_seconds=360)
+    assert mr.resolve_generation_timeout(settings=cfg) == 360.0
+
+
+def test_resolve_generation_timeout_clamps_invalid_values():
+    model = mr.normalize_model(
+        {"id": "x", "generationTimeoutSeconds": 5},
+        settings=_settings([]),
+    )
+    assert mr.resolve_generation_timeout(model, settings=_settings([])) == 30.0
+    cfg = _settings([], comfyui_generation_timeout_seconds=9999)
+    assert mr.resolve_generation_timeout(settings=cfg) == 900.0
+
+
+def test_resolve_generation_timeout_default_when_unset():
+    assert mr.resolve_generation_timeout(settings=_settings([])) == 300.0
+
+
 def test_default_settings_registers_media_keys():
     """Required so /api/auth/settings can persist the registry config."""
     from src.settings import DEFAULT_SETTINGS
@@ -373,4 +409,6 @@ def test_default_settings_registers_media_keys():
     assert "media_models" in DEFAULT_SETTINGS
     assert "default_image_media_model" in DEFAULT_SETTINGS
     assert "comfyui_endpoint_url" in DEFAULT_SETTINGS
+    assert "comfyui_generation_timeout_seconds" in DEFAULT_SETTINGS
+    assert DEFAULT_SETTINGS["comfyui_generation_timeout_seconds"] == 300
     assert DEFAULT_SETTINGS["media_models"] == []

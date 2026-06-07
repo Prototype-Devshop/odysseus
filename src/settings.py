@@ -42,6 +42,10 @@ DEFAULT_SETTINGS = {
     "media_models": [],
     "default_image_media_model": "",
     "comfyui_endpoint_url": "",
+    # Wall-clock poll budget for ComfyUI image generation (seconds). Clamped to
+    # 30–900 in services/media/comfyui.py. Per-model override:
+    # media_models[].generationTimeoutSeconds.
+    "comfyui_generation_timeout_seconds": 300,
     # Privacy / local-first guard: media providers are local-by-default.
     # Loopback (local machine) and private-LAN (local network) endpoints are
     # allowed; only PUBLIC/remote (internet-routable) media endpoints are

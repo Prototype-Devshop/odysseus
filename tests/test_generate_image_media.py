@@ -40,12 +40,13 @@ def _patch_settings(monkeypatch, settings):
 
 def _patch_comfy_generate(monkeypatch, capture):
     def fake_generate(self, *, prompt, width=1024, height=1024, progress_cb=None,
-                      checkpoint=None, **kwargs):
+                      checkpoint=None, timeout=300.0, **kwargs):
         capture["prompt"] = prompt
         capture["width"] = width
         capture["height"] = height
         capture["endpoint"] = self.endpoint_url
         capture["checkpoint"] = checkpoint
+        capture["timeout"] = timeout
         return {
             "ok": True,
             "status": "generated",
@@ -84,6 +85,47 @@ async def test_uses_default_comfyui_model_when_model_omitted(monkeypatch):
     assert result.get("image_size") == "512x512"
     assert capture["prompt"] == "a serene lake"
     assert capture["endpoint"] == "http://localhost:8188"
+
+
+async def test_global_generation_timeout_forwarded_to_provider(monkeypatch):
+    settings = _comfy_settings("qwen-image")
+    settings["comfyui_generation_timeout_seconds"] = 420
+    _patch_settings(monkeypatch, settings)
+    capture = {}
+    _patch_comfy_generate(monkeypatch, capture)
+    _patch_persist(monkeypatch)
+
+    await ai_interaction.do_generate_image("a serene lake", owner=None)
+
+    assert capture["timeout"] == 420.0
+
+
+async def test_model_generation_timeout_overrides_global(monkeypatch):
+    settings = _comfy_settings("qwen-image")
+    settings["comfyui_generation_timeout_seconds"] = 300
+    settings["media_models"][0]["generationTimeoutSeconds"] = 540
+    _patch_settings(monkeypatch, settings)
+    capture = {}
+    _patch_comfy_generate(monkeypatch, capture)
+    _patch_persist(monkeypatch)
+
+    await ai_interaction.do_generate_image("a serene lake", owner=None)
+
+    assert capture["timeout"] == 540.0
+
+
+async def test_bare_size_on_line_two_not_treated_as_model(monkeypatch):
+    _patch_settings(monkeypatch, _comfy_settings("qwen-image"))
+    capture = {}
+    _patch_comfy_generate(monkeypatch, capture)
+    _patch_persist(monkeypatch)
+
+    result = await ai_interaction.do_generate_image("a serene lake\n512x512", owner=None)
+
+    assert result.get("image_model") == "qwen-image"
+    assert result.get("image_size") == "512x512"
+    assert capture["width"] == 512
+    assert capture["height"] == 512
 
 
 # 1a. Configured checkpoint is forwarded to the ComfyUI provider -------------

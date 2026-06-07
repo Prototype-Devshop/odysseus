@@ -22,6 +22,7 @@ MediaModel shape (from the build brief; superfluous keys are ignored):
       "workflowPath": str,       # optional
       "enabled": bool,           # default True when omitted
       "isDefault": bool,         # default False
+      "generationTimeoutSeconds": number,  # optional ComfyUI poll budget override
       "notes": str               # optional
     }
 
@@ -173,7 +174,39 @@ def normalize_model(
         model["checkpoint"] = checkpoint
     if notes is not None:
         model["notes"] = notes
+
+    gen_timeout = raw.get("generationTimeoutSeconds")
+    if gen_timeout is None:
+        gen_timeout = raw.get("generation_timeout_seconds")
+    if gen_timeout is not None and gen_timeout != "":
+        try:
+            model["generationTimeoutSeconds"] = float(gen_timeout)
+        except (TypeError, ValueError):
+            pass
     return model
+
+
+def resolve_generation_timeout(
+    model: Optional[Dict[str, Any]] = None,
+    settings: Optional[Dict[str, Any]] = None,
+) -> float:
+    """Resolve the ComfyUI generation poll budget (model-specific wins over global).
+
+    Order: ``media_models[].generationTimeoutSeconds`` →
+    ``comfyui_generation_timeout_seconds`` → provider default. Values are clamped
+    to 30–900 seconds in ``services.media.comfyui.coerce_generation_timeout``.
+    """
+    from services.media.comfyui import DEFAULT_GENERATE_TIMEOUT, coerce_generation_timeout
+
+    if model is not None:
+        model_raw = model.get("generationTimeoutSeconds")
+        if model_raw is not None and model_raw != "":
+            return coerce_generation_timeout(model_raw)
+    cfg = _load_settings(settings)
+    global_raw = cfg.get("comfyui_generation_timeout_seconds")
+    if global_raw is not None and global_raw != "":
+        return coerce_generation_timeout(global_raw)
+    return float(DEFAULT_GENERATE_TIMEOUT)
 
 
 def load_media_models(

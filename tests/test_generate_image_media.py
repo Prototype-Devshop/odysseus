@@ -39,11 +39,13 @@ def _patch_settings(monkeypatch, settings):
 
 
 def _patch_comfy_generate(monkeypatch, capture):
-    def fake_generate(self, *, prompt, width=1024, height=1024, progress_cb=None, **kwargs):
+    def fake_generate(self, *, prompt, width=1024, height=1024, progress_cb=None,
+                      checkpoint=None, **kwargs):
         capture["prompt"] = prompt
         capture["width"] = width
         capture["height"] = height
         capture["endpoint"] = self.endpoint_url
+        capture["checkpoint"] = checkpoint
         return {
             "ok": True,
             "status": "generated",
@@ -82,6 +84,36 @@ async def test_uses_default_comfyui_model_when_model_omitted(monkeypatch):
     assert result.get("image_size") == "512x512"
     assert capture["prompt"] == "a serene lake"
     assert capture["endpoint"] == "http://localhost:8188"
+
+
+# 1a. Configured checkpoint is forwarded to the ComfyUI provider -------------
+
+async def test_configured_checkpoint_is_forwarded(monkeypatch):
+    settings = _comfy_settings("qwen-image")
+    settings["media_models"][0]["checkpoint"] = "sdxl.safetensors"
+    _patch_settings(monkeypatch, settings)
+    capture = {}
+    _patch_comfy_generate(monkeypatch, capture)
+    _patch_persist(monkeypatch)
+
+    await ai_interaction.do_generate_image("a serene lake", owner=None)
+
+    assert capture["checkpoint"] == "sdxl.safetensors"
+
+
+async def test_checkpoint_required_is_surfaced_safely(monkeypatch):
+    # No checkpoint configured + bundled workflow (has %checkpoint%) → the
+    # real provider must fail before any network call, with a safe message.
+    settings = _comfy_settings("qwen-image")  # no checkpoint
+    _patch_settings(monkeypatch, settings)
+    monkeypatch.setattr(comfyui.httpx, "post", lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not POST")))
+
+    result = await ai_interaction.do_generate_image("a cat", owner=None)
+
+    assert "error" in result
+    assert "checkpoint" in result["error"].lower()
+    for leak in ("/Users/", "://", "8188"):
+        assert leak not in result["error"]
 
 
 # 1b. Owner/session are persisted on the ComfyUI path (F3) ------------------

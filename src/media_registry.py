@@ -144,6 +144,16 @@ def normalize_model(
     workflow_path = raw.get("workflowPath")
     workflow_path = workflow_path.strip() if isinstance(workflow_path, str) and workflow_path.strip() else None
 
+    # Checkpoint name for ComfyUI workflows. Accept either ``checkpoint`` or the
+    # ``checkpointName`` alias. This is a ComfyUI-side model identifier (a name
+    # inside the provider's models dir), NOT a path on the Odysseus host. It is
+    # internal config and is intentionally NOT in _PUBLIC_FIELDS, so it never
+    # leaks through list_media_models.
+    checkpoint = raw.get("checkpoint")
+    if not (isinstance(checkpoint, str) and checkpoint.strip()):
+        checkpoint = raw.get("checkpointName")
+    checkpoint = checkpoint.strip() if isinstance(checkpoint, str) and checkpoint.strip() else None
+
     notes = raw.get("notes")
     notes = notes.strip() if isinstance(notes, str) and notes.strip() else None
 
@@ -159,6 +169,8 @@ def normalize_model(
     }
     if workflow_path is not None:
         model["workflowPath"] = workflow_path
+    if checkpoint is not None:
+        model["checkpoint"] = checkpoint
     if notes is not None:
         model["notes"] = notes
     return model

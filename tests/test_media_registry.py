@@ -88,6 +88,47 @@ def test_normalize_keeps_label_fallback_to_id():
     assert m["label"] == "abc"
 
 
+def test_normalize_accepts_checkpoint():
+    m = mr.normalize_model(
+        {"id": "x", "provider": "comfyui", "checkpoint": "  sdxl.safetensors  "},
+        settings=_settings([]),
+    )
+    assert m["checkpoint"] == "sdxl.safetensors"
+
+
+def test_normalize_accepts_checkpoint_name_alias():
+    m = mr.normalize_model(
+        {"id": "x", "provider": "comfyui", "checkpointName": "flux.safetensors"},
+        settings=_settings([]),
+    )
+    assert m["checkpoint"] == "flux.safetensors"
+
+
+def test_normalize_checkpoint_prefers_checkpoint_over_alias():
+    m = mr.normalize_model(
+        {"id": "x", "checkpoint": "primary.ckpt", "checkpointName": "alias.ckpt"},
+        settings=_settings([]),
+    )
+    assert m["checkpoint"] == "primary.ckpt"
+
+
+def test_normalize_omits_checkpoint_when_absent_or_blank():
+    assert "checkpoint" not in mr.normalize_model({"id": "x"}, settings=_settings([]))
+    assert "checkpoint" not in mr.normalize_model(
+        {"id": "x", "checkpoint": "   "}, settings=_settings([])
+    )
+
+
+def test_to_public_dict_omits_checkpoint():
+    m = mr.normalize_model(
+        {"id": "x", "provider": "comfyui", "checkpoint": "sdxl.safetensors"},
+        settings=_settings([]),
+    )
+    pub = mr.to_public_dict(m)
+    assert "checkpoint" not in pub
+    assert "checkpointName" not in pub
+
+
 # ── load_media_models ──
 
 def test_load_dedupes_by_id():

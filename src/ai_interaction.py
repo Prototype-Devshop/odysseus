@@ -1687,6 +1687,7 @@ async def _generate_image_via_comfyui(
     from services.media.comfyui import ComfyUIProvider
 
     endpoint = (media_model.get("endpointUrl") or "").strip()
+    checkpoint = (media_model.get("checkpoint") or "").strip() or None
     width, height = _parse_size(size)
     provider = ComfyUIProvider(endpoint_url=endpoint)
 
@@ -1712,6 +1713,7 @@ async def _generate_image_via_comfyui(
             prompt=prompt,
             width=width,
             height=height,
+            checkpoint=checkpoint,
             progress_cb=sync_progress,
         )
     except Exception as e:

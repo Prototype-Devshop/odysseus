@@ -13,6 +13,10 @@ from src import media_registry
 
 
 ENDPOINT = "http://localhost:8188"
+# A fake checkpoint name (a ComfyUI-side model identifier, not a local path).
+# The bundled workflow carries a %checkpoint% placeholder, so generation tests
+# that use it must supply a checkpoint to clear the pre-flight checkpoint gate.
+CKPT = "test-ckpt.safetensors"
 
 
 class _FakeResp:
@@ -272,7 +276,9 @@ def test_generate_happy_path_queue_poll_view(monkeypatch):
         return _FakeBytesResp(200, png)
 
     posts, gets = _install_generation_router(monkeypatch, post=post, get=get)
-    result = ComfyUIProvider(ENDPOINT).generate(prompt="a cat", width=512, height=512, seed=7)
+    result = ComfyUIProvider(ENDPOINT).generate(
+        prompt="a cat", width=512, height=512, seed=7, checkpoint=CKPT,
+    )
 
     assert result["ok"] is True
     assert result["status"] == "generated"
@@ -303,7 +309,7 @@ def test_generate_polls_until_output_ready(monkeypatch):
         return _FakeBytesResp(200, png)
 
     _install_generation_router(monkeypatch, post=post, get=get)
-    result = ComfyUIProvider(ENDPOINT).generate(prompt="x", seed=1, poll_interval=0)
+    result = ComfyUIProvider(ENDPOINT).generate(prompt="x", seed=1, poll_interval=0, checkpoint=CKPT)
 
     assert result["ok"] is True
     assert state["polls"] >= 3
@@ -357,7 +363,7 @@ def test_generate_unreachable_endpoint(monkeypatch):
         raise AssertionError("should not reach GET")
 
     _install_generation_router(monkeypatch, post=post, get=get)
-    result = ComfyUIProvider(ENDPOINT).generate(prompt="x", seed=1)
+    result = ComfyUIProvider(ENDPOINT).generate(prompt="x", seed=1, checkpoint=CKPT)
 
     assert result["ok"] is False
     assert result["status"] == "unreachable"
@@ -371,7 +377,7 @@ def test_generate_queue_http_error_is_preserved_without_leaks(monkeypatch):
         raise AssertionError("should not poll on queue failure")
 
     _install_generation_router(monkeypatch, post=post, get=get)
-    result = ComfyUIProvider(ENDPOINT).generate(prompt="x", seed=1)
+    result = ComfyUIProvider(ENDPOINT).generate(prompt="x", seed=1, checkpoint=CKPT)
 
     assert result["ok"] is False
     assert result["status"] == "generation_failed"
@@ -393,7 +399,7 @@ def test_generate_times_out_when_history_never_ready(monkeypatch):
 
     _install_generation_router(monkeypatch, post=post, get=get)
     # timeout=0 makes the polling budget elapse immediately.
-    result = ComfyUIProvider(ENDPOINT).generate(prompt="x", seed=1, timeout=0, poll_interval=0)
+    result = ComfyUIProvider(ENDPOINT).generate(prompt="x", seed=1, timeout=0, poll_interval=0, checkpoint=CKPT)
 
     assert result["ok"] is False
     assert result["status"] == "timeout"
@@ -409,7 +415,7 @@ def test_generate_no_image_in_output(monkeypatch):
         raise AssertionError("should not fetch /view without an image")
 
     _install_generation_router(monkeypatch, post=post, get=get)
-    result = ComfyUIProvider(ENDPOINT).generate(prompt="x", seed=1, poll_interval=0)
+    result = ComfyUIProvider(ENDPOINT).generate(prompt="x", seed=1, poll_interval=0, checkpoint=CKPT)
 
     assert result["ok"] is False
     assert result["status"] == "generation_failed"
@@ -432,8 +438,71 @@ def test_bundled_workflow_loads_and_has_placeholders():
     wf = comfyui._load_default_workflow()
     assert isinstance(wf, dict) and wf
     flat = str(wf)
-    for token in (comfyui.PH_PROMPT, comfyui.PH_SEED, comfyui.PH_WIDTH, comfyui.PH_HEIGHT):
+    for token in (comfyui.PH_PROMPT, comfyui.PH_SEED, comfyui.PH_WIDTH,
+                  comfyui.PH_HEIGHT, comfyui.PH_CHECKPOINT):
         assert token in flat
+
+
+def test_bundled_workflow_has_no_hardcoded_checkpoint():
+    # The committed workflow must stay portable — only the %checkpoint% token,
+    # never a machine-specific checkpoint file.
+    flat = str(comfyui._load_default_workflow()).lower()
+    assert ".safetensors" not in flat
+    assert ".ckpt" not in flat
+
+
+# Checkpoint configuration (live-test blocker fix) --------------------------
+
+def test_generate_substitutes_checkpoint_when_configured(monkeypatch):
+    captured = {}
+
+    def post(url, body):
+        captured["wf"] = body["prompt"]
+        return _FakeResp(200, {"prompt_id": "p"})
+
+    def get(url, params):
+        if "/history/" in url:
+            return _FakeResp(200, _history_with_image("p"))
+        return _FakeBytesResp(200, b"IMG")
+
+    _install_generation_router(monkeypatch, post=post, get=get)
+    result = ComfyUIProvider(ENDPOINT).generate(
+        prompt="a cat", seed=1, poll_interval=0, checkpoint="my_model.safetensors",
+    )
+
+    assert result["ok"] is True
+    # Node 4 is the CheckpointLoaderSimple in the bundled workflow.
+    assert captured["wf"]["4"]["inputs"]["ckpt_name"] == "my_model.safetensors"
+    # No placeholder remains anywhere.
+    assert not comfyui._workflow_has_placeholder(captured["wf"], comfyui.PH_CHECKPOINT)
+
+
+def test_generate_requires_checkpoint_before_post(monkeypatch):
+    def boom(*a, **k):
+        raise AssertionError("must not POST /prompt when checkpoint is missing")
+
+    monkeypatch.setattr(comfyui.httpx, "post", boom)
+    monkeypatch.setattr(comfyui.httpx, "get", boom)
+    # Bundled workflow has %checkpoint%; no checkpoint supplied → fail early.
+    result = ComfyUIProvider(ENDPOINT).generate(prompt="a cat", seed=1)
+
+    assert result["ok"] is False
+    assert result["status"] == "checkpoint_required"
+    text = media_registry.format_degraded_message(result)
+    assert "checkpoint" in text.lower()
+    # Leak-safe: no URL / host / path in the message.
+    assert "://" not in text and ENDPOINT not in text and "/Users/" not in text
+
+
+def test_apply_workflow_params_leaves_checkpoint_when_none():
+    wf = {"4": {"class_type": "CheckpointLoaderSimple",
+                "inputs": {"ckpt_name": comfyui.PH_CHECKPOINT}}}
+    out = comfyui.apply_workflow_params(wf, prompt="p", seed=1, width=64, height=64)
+    assert out["4"]["inputs"]["ckpt_name"] == comfyui.PH_CHECKPOINT  # unchanged
+    out2 = comfyui.apply_workflow_params(
+        wf, prompt="p", seed=1, width=64, height=64, checkpoint="x.safetensors",
+    )
+    assert out2["4"]["inputs"]["ckpt_name"] == "x.safetensors"
 
 
 # F2: local-by-default endpoint enforcement ---------------------------------
@@ -516,7 +585,7 @@ def test_remote_allowed_when_explicitly_enabled(monkeypatch):
         return _FakeBytesResp(200, b"IMG")
 
     _install_generation_router(monkeypatch, post=post, get=get)
-    result = ComfyUIProvider(REMOTE_ENDPOINT, allow_remote=True).generate(prompt="x", seed=1)
+    result = ComfyUIProvider(REMOTE_ENDPOINT, allow_remote=True).generate(prompt="x", seed=1, checkpoint=CKPT)
 
     assert result["ok"] is True
     assert result["status"] == "generated"
@@ -544,14 +613,14 @@ def test_generate_errors_never_leak_endpoint_url(monkeypatch):
         raise httpx.ConnectError("connect to 127.0.0.1:9999 failed")
 
     _install_generation_router(monkeypatch, post=post_unreach, get=lambda *a: None)
-    r1 = ComfyUIProvider(secret_local).generate(prompt="x", seed=1)
+    r1 = ComfyUIProvider(secret_local).generate(prompt="x", seed=1, checkpoint=CKPT)
     t1 = media_registry.format_degraded_message(r1)
     assert r1["status"] == "unreachable"
     assert "127.0.0.1" not in t1 and "9999" not in t1
 
     # generation_failed (queue HTTP error)
     _install_generation_router(monkeypatch, post=lambda u, b: _FakeResp(500, {}), get=lambda *a: None)
-    r2 = ComfyUIProvider(secret_local).generate(prompt="x", seed=1)
+    r2 = ComfyUIProvider(secret_local).generate(prompt="x", seed=1, checkpoint=CKPT)
     t2 = media_registry.format_degraded_message(r2)
     assert r2["status"] == "generation_failed"
     assert "127.0.0.1" not in t2 and "9999" not in t2
@@ -576,5 +645,5 @@ def test_history_prompt_id_is_url_encoded(monkeypatch):
         return _FakeBytesResp(200, b"IMG")
 
     _install_generation_router(monkeypatch, post=post, get=get)
-    result = ComfyUIProvider(ENDPOINT).generate(prompt="x", seed=1, poll_interval=0)
+    result = ComfyUIProvider(ENDPOINT).generate(prompt="x", seed=1, poll_interval=0, checkpoint=CKPT)
     assert result["ok"] is True

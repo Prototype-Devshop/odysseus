@@ -42,6 +42,8 @@
 |----|--------|-----------|
 | T4.3 (live verify) | ComfyUI generation is implemented and unit-tested with mocked httpx, but a real queue→poll→retrieve round-trip is unverified | A running ComfyUI endpoint available for testing (D1) |
 
+> **Checkpoint blocker resolved (portable).** The bundled workflow keeps its `%checkpoint%` placeholder — no machine-specific checkpoint is committed. Media model entries may now set `checkpoint` (or `checkpointName`); `do_generate_image` forwards it into `apply_workflow_params`. If `%checkpoint%` is present but unconfigured, generation fails before any network call with a leak-safe `checkpoint_required` message. Live testing now only requires configuring a checkpoint name in the media model config (no edits to the committed workflow file).
+
 > All open questions (OQ-1…OQ-9) were resolved on S2 kickoff; see [`open-questions.md`](open-questions.md). The remaining true blocker is environmental (a reachable ComfyUI instance for S4 generation verification).
 
 ## Dependencies between tasks

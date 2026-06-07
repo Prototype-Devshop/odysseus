@@ -239,6 +239,20 @@ def apply_workflow_params(
     return wf
 
 
+def _workflow_has_placeholder(workflow: Dict[str, Any], token: str) -> bool:
+    """True if any node ``inputs`` value still equals ``token`` (unsubstituted)."""
+    for node in workflow.values():
+        if not isinstance(node, dict):
+            continue
+        inputs = node.get("inputs")
+        if not isinstance(inputs, dict):
+            continue
+        for value in inputs.values():
+            if value == token:
+                return True
+    return False
+
+
 def _first_image_output(history_entry: Dict[str, Any]) -> Optional[Dict[str, str]]:
     """Extract the first produced image reference from a ComfyUI history entry.
 
@@ -448,6 +462,11 @@ class ComfyUIProvider:
             wf, prompt=prompt, seed=seed, width=width, height=height,
             negative_prompt=negative_prompt, checkpoint=checkpoint,
         )
+
+        # Fail early (before any network call) if the workflow still needs a
+        # checkpoint but none was configured — keeps a clear, leak-safe message.
+        if _workflow_has_placeholder(wf, PH_CHECKPOINT):
+            return self._checkpoint_required()
 
         # 1) Queue the workflow.
         _safe_progress(progress_cb, "Submitting image job to ComfyUI…")
@@ -687,6 +706,23 @@ class ComfyUIProvider:
                 "Try again.",
             ],
             detail=detail or None,
+        )
+
+    def _checkpoint_required(self) -> Dict[str, Any]:
+        return self._result(
+            "checkpoint_required",
+            ok=False,
+            message=(
+                "ComfyUI image generation is configured, but the selected "
+                "workflow requires a checkpoint. Configure a checkpoint for the "
+                "media model before generating."
+            ),
+            checked_status="checkpoint not configured",
+            next_steps=[
+                "Add a 'checkpoint' (or 'checkpointName') to the media model "
+                "naming a checkpoint installed in ComfyUI.",
+                "Then try generating again.",
+            ],
         )
 
     def _workflow_missing(self) -> Dict[str, Any]:

@@ -59,8 +59,15 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 
         # Delegate to the canonical owner-aware path (OQ-5). This keeps the
         # OpenAI-compatible behavior and adds media-registry / ComfyUI routing
-        # in one place rather than duplicating it here. The MCP transport has no
-        # auth context, so owner is left unset (the registry is global for MVP).
+        # in one place rather than duplicating it here.
+        #
+        # OWNER/SESSION LIMITATION (Gatekeeper F3): this MCP server runs as a
+        # separate stdio subprocess and receives no auth/session context, so it
+        # cannot attribute generations to an owner. Images created via this path
+        # are therefore saved with owner/session unset (acceptable for the
+        # single-user local default; revisit before multi-user deployment). The
+        # direct chat path (routes/chat_routes.py) DOES pass the real owner and
+        # remains owner/session-scoped — do not weaken it.
         content = "\n".join([prompt, model_spec or "", size or "", quality or ""])
         result = await do_generate_image(content, owner=None)
 

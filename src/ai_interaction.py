@@ -1715,7 +1715,9 @@ async def _generate_image_via_comfyui(
             progress_cb=sync_progress,
         )
     except Exception as e:
-        return {"error": f"ComfyUI generation error: {str(e)}"}
+        # Keep the raw exception (may contain a URL/path) in logs only.
+        logger.warning(f"ComfyUI generation error: {e}")
+        return {"error": "ComfyUI image generation failed. See server logs for details."}
 
     if not result.get("ok"):
         return {"error": media_registry.format_degraded_message(result)}

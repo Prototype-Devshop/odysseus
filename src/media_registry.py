@@ -369,39 +369,50 @@ def default_image_model_or_degraded(
 
 
 def image_generation_routable(
-    owner: str = "", settings: Optional[Dict[str, Any]] = None
+    owner: str = "",
+    settings: Optional[Dict[str, Any]] = None,
+    *,
+    include_legacy: bool = True,
+    include_db: bool = True,
 ) -> bool:
     """True when ``generate_image`` has a configured path (no network probing).
 
     Matches the pre-route gate for concrete creation prompts:
       1. resolvable default media-registry image model, or
-      2. legacy ``image_model`` setting, or
-      3. at least one enabled image-type ``ModelEndpoint`` in the DB.
+      2. legacy ``image_model`` setting (when ``include_legacy``), or
+      3. at least one enabled image-type ``ModelEndpoint`` in the DB
+         (when ``include_db``).
+
+    ``include_legacy`` / ``include_db`` default to True for runtime callers.
+    Tests can disable them to assert the settings-only path without depending
+    on the developer's local DB or legacy config.
     """
     cfg = _load_settings(settings)
     if resolve_default_model(kind="image", owner=owner, settings=cfg) is not None:
         return True
-    legacy = cfg.get("image_model")
-    if isinstance(legacy, str) and legacy.strip():
-        return True
-    try:
-        from src.database import SessionLocal, ModelEndpoint
-        from src.auth_helpers import owner_filter
-
-        db = SessionLocal()
+    if include_legacy:
+        legacy = cfg.get("image_model")
+        if isinstance(legacy, str) and legacy.strip():
+            return True
+    if include_db:
         try:
-            q = db.query(ModelEndpoint).filter(
-                ModelEndpoint.is_enabled == True,
-                ModelEndpoint.model_type == "image",
-            )
-            if owner:
-                q = owner_filter(q, ModelEndpoint, owner)
-            if q.first() is not None:
-                return True
-        finally:
-            db.close()
-    except Exception:
-        pass
+            from src.database import SessionLocal, ModelEndpoint
+            from src.auth_helpers import owner_filter
+
+            db = SessionLocal()
+            try:
+                q = db.query(ModelEndpoint).filter(
+                    ModelEndpoint.is_enabled == True,
+                    ModelEndpoint.model_type == "image",
+                )
+                if owner:
+                    q = owner_filter(q, ModelEndpoint, owner)
+                if q.first() is not None:
+                    return True
+            finally:
+                db.close()
+        except Exception:
+            pass
     return False
 
 

@@ -245,17 +245,93 @@ def test_to_public_dict_omits_internal_paths():
 
 
 def test_image_generation_routable_false_when_no_models_or_legacy():
-    assert mr.image_generation_routable(settings=_settings([])) is False
+    assert mr.image_generation_routable(
+        settings=_settings([]),
+        include_legacy=False,
+        include_db=False,
+    ) is False
 
 
 def test_image_generation_routable_true_with_default_media_model():
     cfg = _settings([_comfy_image(isDefault=True)])
-    assert mr.image_generation_routable(settings=cfg) is True
+    assert mr.image_generation_routable(
+        settings=cfg,
+        include_legacy=False,
+        include_db=False,
+    ) is True
 
 
 def test_image_generation_routable_true_with_legacy_image_model():
     cfg = _settings([], image_model="gpt-image-1")
-    assert mr.image_generation_routable(settings=cfg) is True
+    assert mr.image_generation_routable(
+        settings=cfg,
+        include_db=False,
+    ) is True
+
+
+def test_image_generation_routable_false_when_legacy_disabled(monkeypatch):
+    cfg = _settings([], image_model="gpt-image-1")
+    assert mr.image_generation_routable(
+        settings=cfg,
+        include_legacy=False,
+        include_db=False,
+    ) is False
+
+
+def test_image_generation_routable_true_with_enabled_db_endpoint(monkeypatch):
+    class _FakeQuery:
+        def __init__(self, result):
+            self._result = result
+
+        def filter(self, *args, **kwargs):
+            return self
+
+        def first(self):
+            return self._result
+
+    class _FakeDB:
+        def __init__(self, result):
+            self._result = result
+
+        def query(self, *args):
+            return _FakeQuery(self._result)
+
+        def close(self):
+            pass
+
+    import src.database as db_mod
+
+    monkeypatch.setattr(db_mod, "SessionLocal", lambda: _FakeDB(object()))
+    assert mr.image_generation_routable(
+        settings=_settings([]),
+        include_legacy=False,
+        include_db=True,
+    ) is True
+
+
+def test_image_generation_routable_false_when_db_fallback_disabled(monkeypatch):
+    class _FakeQuery:
+        def filter(self, *args, **kwargs):
+            return self
+
+        def first(self):
+            return object()
+
+    class _FakeDB:
+        def query(self, *args):
+            return _FakeQuery()
+
+        def close(self):
+            pass
+
+    import src.database as db_mod
+
+    monkeypatch.setattr(db_mod, "SessionLocal", lambda: _FakeDB())
+    assert mr.image_generation_routable(
+        settings=_settings([]),
+        include_legacy=False,
+        include_db=False,
+    ) is False
 
 
 def test_format_degraded_message_renders_block():

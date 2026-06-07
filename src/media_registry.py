@@ -23,6 +23,7 @@ MediaModel shape (from the build brief; superfluous keys are ignored):
       "enabled": bool,           # default True when omitted
       "isDefault": bool,         # default False
       "generationTimeoutSeconds": number,  # optional ComfyUI poll budget override
+      "defaultSize": str,        # optional WxH default for ComfyUI generation
       "notes": str               # optional
     }
 
@@ -55,6 +56,11 @@ MEDIA_CAPABILITIES = (
 
 # Suggested (not stored) default endpoint surfaced in degraded-state guidance.
 SUGGESTED_COMFYUI_ENDPOINT = "http://localhost:8188"
+
+# ComfyUI / local media generation sizes (WxH). Conservative default for
+# first-run smoke tests on Apple Silicon / 16 GB class machines.
+ALLOWED_IMAGE_SIZES = frozenset({"512x512", "768x768", "1024x1024"})
+DEFAULT_COMFYUI_IMAGE_SIZE = "512x512"
 
 # Maps a media kind to the settings key naming its preferred default model.
 # Only image is wired for the MVP; video is intentionally left out.
@@ -183,7 +189,44 @@ def normalize_model(
             model["generationTimeoutSeconds"] = float(gen_timeout)
         except (TypeError, ValueError):
             pass
+
+    default_size = raw.get("defaultSize")
+    if default_size is None:
+        default_size = raw.get("default_size")
+    if isinstance(default_size, str) and default_size.strip():
+        normalized_size = normalize_image_size(default_size)
+        if normalized_size:
+            model["defaultSize"] = normalized_size
     return model
+
+
+def normalize_image_size(raw: object) -> Optional[str]:
+    """Return a supported WxH size string, or None when invalid."""
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    size = raw.strip().lower()
+    return size if size in ALLOWED_IMAGE_SIZES else None
+
+
+def resolve_image_size(
+    *,
+    explicit_size: Optional[str] = None,
+    media_model: Optional[Dict[str, Any]] = None,
+    settings: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Resolve ComfyUI generation size (explicit → model → global → 512x512)."""
+    explicit = normalize_image_size(explicit_size or "")
+    if explicit:
+        return explicit
+    if media_model is not None:
+        model_size = normalize_image_size(media_model.get("defaultSize") or "")
+        if model_size:
+            return model_size
+    cfg = _load_settings(settings)
+    global_size = normalize_image_size(cfg.get("comfyui_default_image_size") or "")
+    if global_size:
+        return global_size
+    return DEFAULT_COMFYUI_IMAGE_SIZE
 
 
 def resolve_generation_timeout(

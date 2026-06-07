@@ -1795,7 +1795,7 @@ async def do_generate_image(content: str, session_id: Optional[str] = None, owne
     Content format:
       Line 1: prompt describing the image
       Line 2: model name (optional, default auto-detects: prefers gpt-image-1.5 > gpt-image-1)
-      Line 3: size (optional, defaults to 1024x1024)
+      Line 3: size (optional; ComfyUI defaults to 512x512, OpenAI to 1024x1024)
       Line 4: quality (optional, defaults to medium — options: low, medium, high, auto)
     """
     import base64
@@ -1805,7 +1805,7 @@ async def do_generate_image(content: str, session_id: Optional[str] = None, owne
     lines = content.strip().split("\n")
     prompt = lines[0].strip() if lines else ""
     model_spec = lines[1].strip() if len(lines) > 1 and lines[1].strip() else ""
-    size = lines[2].strip() if len(lines) > 2 and lines[2].strip() else "1024x1024"
+    size = lines[2].strip() if len(lines) > 2 and lines[2].strip() else ""
     quality = lines[3].strip() if len(lines) > 3 and lines[3].strip() else "medium"
 
     # Bare WxH on line 2 is a size, not a model id (common manual call pattern).
@@ -1853,10 +1853,15 @@ async def do_generate_image(content: str, session_id: Optional[str] = None, owne
         media_model = None
 
     if media_model is not None and media_model.get("provider") == "comfyui":
+        comfy_size = media_registry.resolve_image_size(
+            explicit_size=size or None,
+            media_model=media_model,
+            settings=_settings,
+        )
         return await _generate_image_via_comfyui(
             media_model,
             prompt=prompt,
-            size=size,
+            size=comfy_size,
             quality=quality,
             session_id=session_id,
             owner=owner,
@@ -1935,6 +1940,9 @@ async def do_generate_image(content: str, session_id: Optional[str] = None, owne
     # Build the images endpoint URL from the chat completions URL
     base_url = url.replace("/chat/completions", "").replace("/v1/messages", "").rstrip("/")
     images_url = base_url + "/images/generations"
+
+    if not size:
+        size = "1024x1024"
 
     # Validate size for cloud image models (local diffusion accepts any WxH)
     valid_gpt_sizes = {"1024x1024", "1024x1536", "1536x1024", "auto"}

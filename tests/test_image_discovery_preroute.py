@@ -184,13 +184,15 @@ def test_configured_creation_preroutes_generate_image_without_model_call(monkeyp
             "session_id": session_id,
             "owner": owner,
         })
+        if progress_cb is not None:
+            await progress_cb({"type": "progress", "message": "Waiting for ComfyUI to finish…"})
         return {
             "results": "Generated image for: a red bicycle",
             "image_url": "/api/generated-image/abc.png",
             "image_id": "gid-1",
             "image_prompt": content,
             "image_model": "sd15-comfy",
-            "image_size": "1024x1024",
+            "image_size": "512x512",
         }
 
     async def _fail_dispatch(*_a, **_k):
@@ -232,14 +234,26 @@ def test_configured_creation_preroutes_generate_image_without_model_call(monkeyp
     tool_outputs = [e for e in events if e.get("type") == "tool_output"]
     assert tool_outputs[0]["tool"] == "generate_image"
     assert tool_outputs[0]["image_url"] == "/api/generated-image/abc.png"
+    assert tool_outputs[0]["image_id"] == "gid-1"
+    progress = [e for e in events if e.get("type") == "tool_progress"]
+    assert progress and progress[0]["tool"] == "generate_image"
     deltas = "".join(e.get("delta", "") for e in events if "delta" in e)
     assert "Direct link:" in deltas
     assert "/api/generated-image/abc.png" in deltas
     assert "local_comfyui" not in deltas.lower()
     agent_steps = [e for e in events if e.get("type") == "agent_step"]
     assert agent_steps and agent_steps[0]["round"] == 1
+    tool_out_idx = next(i for i, e in enumerate(events) if e.get("type") == "tool_output")
+    agent_step_idx = next(i for i, e in enumerate(events) if e.get("type") == "agent_step")
+    delta_idx = next(i for i, e in enumerate(events) if "delta" in e)
+    assert tool_out_idx < agent_step_idx < delta_idx
     metrics = next(e for e in events if e.get("type") == "metrics")
     assert metrics["data"]["round_texts"] == [deltas]
+    tool_events = metrics["data"]["tool_events"]
+    assert tool_events[0]["tool"] == "generate_image"
+    assert tool_events[0]["image_url"] == "/api/generated-image/abc.png"
+    assert tool_events[0]["image_id"] == "gid-1"
+    assert any(c == "data: [DONE]\n\n" for c in chunks)
 
 
 def test_configured_creation_failure_returns_sanitized_error(monkeypatch):

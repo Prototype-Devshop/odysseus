@@ -1799,6 +1799,8 @@ async def stream_agent_loop(
     # Strip internal metadata keys before sending to the LLM API
     messages = [{k: v for k, v in msg.items() if k != "_protected"} for msg in messages]
 
+    yield f"data: {json.dumps({'type': 'agent_prep', 'data': {k: round(v, 3) for k, v in prep_timings.items()}})}\n\n"
+
     # Deterministic pre-route: image-capability questions, unconfigured creation
     # (list_media_models + degraded state), and configured creation (canonical
     # do_generate_image) — so the model cannot invent model-specific pseudo-tools.
@@ -1821,11 +1823,47 @@ async def stream_agent_loop(
                 yield (
                     f'data: {json.dumps({"type": "tool_start", "tool": "generate_image", "command": _gen_cmd, "round": 0})}\n\n'
                 )
-                result = await do_generate_image(
-                    _last_user.strip(),
-                    session_id=session_id,
-                    owner=owner,
-                )
+                _progress_q: asyncio.Queue = asyncio.Queue()
+
+                async def _gen_progress(payload):
+                    msg = payload.get("message", "") if isinstance(payload, dict) else str(payload)
+                    if msg:
+                        await _progress_q.put(msg)
+
+                async def _run_configured_generate():
+                    return await do_generate_image(
+                        _last_user.strip(),
+                        session_id=session_id,
+                        owner=owner,
+                        progress_cb=_gen_progress,
+                    )
+
+                _gen_task = asyncio.create_task(_run_configured_generate())
+                while not _gen_task.done():
+                    _get_task = asyncio.create_task(_progress_q.get())
+                    done, _pending = await asyncio.wait(
+                        {_gen_task, _get_task},
+                        return_when=asyncio.FIRST_COMPLETED,
+                        timeout=15.0,
+                    )
+                    if _get_task in done:
+                        _msg = _get_task.result()
+                        yield (
+                            f'data: {json.dumps({"type": "tool_progress", "tool": "generate_image", "round": 0, "message": _msg})}\n\n'
+                        )
+                    else:
+                        _get_task.cancel()
+                    if not done:
+                        yield (
+                            f'data: {json.dumps({"type": "tool_progress", "tool": "generate_image", "round": 0, "message": "Generating image…"})}\n\n'
+                        )
+                result = await _gen_task
+                while not _progress_q.empty():
+                    _tail_msg = _progress_q.get_nowait()
+                    if _tail_msg:
+                        yield (
+                            f'data: {json.dumps({"type": "tool_progress", "tool": "generate_image", "round": 0, "message": _tail_msg})}\n\n'
+                        )
                 output_text = _generate_image_tool_output_text(result)
                 tool_output_data = {
                     "type": "tool_output",
@@ -1835,7 +1873,10 @@ async def stream_agent_loop(
                     "exit_code": 0 if not (isinstance(result, dict) and result.get("error")) else 1,
                 }
                 if isinstance(result, dict):
-                    for k in ("image_url", "image_prompt", "image_model", "image_size", "image_quality"):
+                    for k in (
+                        "image_url", "image_id", "image_prompt",
+                        "image_model", "image_size", "image_quality",
+                    ):
                         if result.get(k):
                             tool_output_data[k] = result[k]
                 yield f'data: {json.dumps(tool_output_data)}\n\n'
@@ -1849,7 +1890,10 @@ async def stream_agent_loop(
                     "exit_code": tool_output_data["exit_code"],
                 }
                 if isinstance(result, dict) and result.get("image_url"):
-                    for ik in ("image_url", "image_prompt", "image_model", "image_size", "image_quality"):
+                    for ik in (
+                        "image_url", "image_id", "image_prompt",
+                        "image_model", "image_size", "image_quality",
+                    ):
                         if result.get(ik):
                             _image_creation_tool_event[ik] = result[ik]
                 logger.info(
@@ -1919,8 +1963,6 @@ async def stream_agent_loop(
                     )
             except Exception as e:
                 logger.warning("[image-discovery] pre-route failed (non-fatal): %s", e)
-
-    yield f"data: {json.dumps({'type': 'agent_prep', 'data': {k: round(v, 3) for k, v in prep_timings.items()}})}\n\n"
 
     full_response = ""
     total_start = time.time()

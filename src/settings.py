@@ -46,6 +46,9 @@ DEFAULT_SETTINGS = {
     # 30–900 in services/media/comfyui.py. Per-model override:
     # media_models[].generationTimeoutSeconds.
     "comfyui_generation_timeout_seconds": 300,
+    # Default WxH for ComfyUI / local media generation when the request omits
+    # size. Per-model override: media_models[].defaultSize.
+    "comfyui_default_image_size": "512x512",
     # Privacy / local-first guard: media providers are local-by-default.
     # Loopback (local machine) and private-LAN (local network) endpoints are
     # allowed; only PUBLIC/remote (internet-routable) media endpoints are

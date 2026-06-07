@@ -402,6 +402,31 @@ def test_resolve_generation_timeout_default_when_unset():
     assert mr.resolve_generation_timeout(settings=_settings([])) == 300.0
 
 
+def test_normalize_model_parses_default_size():
+    m = mr.normalize_model(
+        {"id": "x", "defaultSize": "768x768"},
+        settings=_settings([]),
+    )
+    assert m["defaultSize"] == "768x768"
+
+
+def test_resolve_image_size_order():
+    model = mr.normalize_model(
+        {"id": "x", "defaultSize": "768x768"},
+        settings=_settings([]),
+    )
+    cfg = _settings([], comfyui_default_image_size="1024x1024")
+    assert mr.resolve_image_size(explicit_size="512x512", media_model=model, settings=cfg) == "512x512"
+    assert mr.resolve_image_size(media_model=model, settings=cfg) == "768x768"
+    assert mr.resolve_image_size(settings=cfg) == "1024x1024"
+    assert mr.resolve_image_size(settings=_settings([])) == "512x512"
+
+
+def test_normalize_image_size_rejects_invalid():
+    assert mr.normalize_image_size("999x999") is None
+    assert mr.normalize_image_size("512x512") == "512x512"
+
+
 def test_default_settings_registers_media_keys():
     """Required so /api/auth/settings can persist the registry config."""
     from src.settings import DEFAULT_SETTINGS
@@ -411,4 +436,6 @@ def test_default_settings_registers_media_keys():
     assert "comfyui_endpoint_url" in DEFAULT_SETTINGS
     assert "comfyui_generation_timeout_seconds" in DEFAULT_SETTINGS
     assert DEFAULT_SETTINGS["comfyui_generation_timeout_seconds"] == 300
+    assert "comfyui_default_image_size" in DEFAULT_SETTINGS
+    assert DEFAULT_SETTINGS["comfyui_default_image_size"] == "512x512"
     assert DEFAULT_SETTINGS["media_models"] == []

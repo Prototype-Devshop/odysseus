@@ -114,6 +114,46 @@ async def test_model_generation_timeout_overrides_global(monkeypatch):
     assert capture["timeout"] == 540.0
 
 
+async def test_comfyui_defaults_to_512_when_no_explicit_size(monkeypatch):
+    _patch_settings(monkeypatch, _comfy_settings("qwen-image"))
+    capture = {}
+    _patch_comfy_generate(monkeypatch, capture)
+    _patch_persist(monkeypatch)
+
+    result = await ai_interaction.do_generate_image("a serene lake", owner=None)
+
+    assert capture["width"] == 512
+    assert capture["height"] == 512
+    assert result.get("image_size") == "512x512"
+
+
+async def test_comfyui_explicit_1024_size_respected(monkeypatch):
+    _patch_settings(monkeypatch, _comfy_settings("qwen-image"))
+    capture = {}
+    _patch_comfy_generate(monkeypatch, capture)
+    _patch_persist(monkeypatch)
+
+    await ai_interaction.do_generate_image("a serene lake\n\n1024x1024", owner=None)
+
+    assert capture["width"] == 1024
+    assert capture["height"] == 1024
+
+
+async def test_model_default_size_overrides_global_default(monkeypatch):
+    settings = _comfy_settings("qwen-image")
+    settings["comfyui_default_image_size"] = "512x512"
+    settings["media_models"][0]["defaultSize"] = "768x768"
+    _patch_settings(monkeypatch, settings)
+    capture = {}
+    _patch_comfy_generate(monkeypatch, capture)
+    _patch_persist(monkeypatch)
+
+    await ai_interaction.do_generate_image("a serene lake", owner=None)
+
+    assert capture["width"] == 768
+    assert capture["height"] == 768
+
+
 async def test_bare_size_on_line_two_not_treated_as_model(monkeypatch):
     _patch_settings(monkeypatch, _comfy_settings("qwen-image"))
     capture = {}

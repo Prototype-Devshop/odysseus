@@ -1931,6 +1931,9 @@ async def stream_agent_loop(
             "output": _image_creation_final_answer,
             "exit_code": 0,
         })
+        # Frontend hides the initial bubble on tool_start when there is no prose
+        # yet; agent_step creates the visible round bubble before text deltas.
+        yield f'data: {json.dumps({"type": "agent_step", "round": 1})}\n\n'
         yield f'data: {json.dumps({"delta": _image_creation_final_answer})}\n\n'
 
     for round_num in range(1, max_rounds + 1):

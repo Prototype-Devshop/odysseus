@@ -121,7 +121,12 @@ def test_creation_preroute_streams_degraded_answer_without_model_call(monkeypatc
     assert model_called == []
     tool_starts = [e for e in events if e.get("type") == "tool_start"]
     assert tool_starts and tool_starts[0]["tool"] == "list_media_models"
+    agent_steps = [e for e in events if e.get("type") == "agent_step"]
+    assert agent_steps and agent_steps[0]["round"] == 1
     deltas = "".join(e.get("delta", "") for e in events if "delta" in e)
+    delta_idx = next(i for i, e in enumerate(events) if "delta" in e)
+    agent_step_idx = next(i for i, e in enumerate(events) if e.get("type") == "agent_step")
+    assert agent_step_idx < delta_idx, "agent_step must precede final delta for live render"
     assert "no image model" in deltas.lower()
     assert "available as a tool" in deltas.lower()
     assert "cannot generate" not in deltas.lower()

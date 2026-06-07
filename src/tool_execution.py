@@ -13,11 +13,14 @@ import json
 import logging
 import os
 import pathlib
+import re
 import sys
 import time
 from typing import Any, Awaitable, Callable, Dict, Optional, Tuple
 
 from src.tool_security import is_public_blocked_tool, owner_is_admin_or_single_user
+from src.tool_policy import ToolPolicy
+from src.constants import MAX_OUTPUT_CHARS, MAX_READ_CHARS, MAX_DIFF_LINES
 
 # Persistent working directory for agent subprocesses.
 # Resolves to <repo_root>/data, which is the bind-mounted volume in Docker
@@ -25,10 +28,6 @@ from src.tool_security import is_public_blocked_tool, owner_is_admin_or_single_u
 # Using this as cwd and HOME prevents the agent from silently creating files
 # in ephemeral container layers that are lost on the next rebuild.
 _AGENT_WORKDIR = str(pathlib.Path(__file__).parent.parent / "data")
-
-MAX_OUTPUT_CHARS = 10_000
-MAX_READ_CHARS = 20_000
-MAX_DIFF_LINES = 400  # cap unified-diff size returned to the UI
 
 
 def _unified_diff(old: str, new: str, path: str) -> Optional[Dict[str, Any]]:
@@ -49,8 +48,8 @@ def _unified_diff(old: str, new: str, path: str) -> Optional[Dict[str, Any]]:
         fromfile=f"a/{label}", tofile=f"b/{label}",
         lineterm="",
     ))
-    added = sum(1 for l in diff_lines if l.startswith("+") and not l.startswith("+++"))
-    removed = sum(1 for l in diff_lines if l.startswith("-") and not l.startswith("---"))
+    added = sum(1 for line in diff_lines if line.startswith("+") and not line.startswith("+++"))
+    removed = sum(1 for line in diff_lines if line.startswith("-") and not line.startswith("---"))
     truncated = False
     if len(diff_lines) > MAX_DIFF_LINES:
         diff_lines = diff_lines[:MAX_DIFF_LINES]
@@ -67,12 +66,13 @@ def _unified_diff(old: str, new: str, path: str) -> Optional[Dict[str, Any]]:
     }
 
 
-async def _do_edit_file(content: str) -> Dict[str, Any]:
+async def _do_edit_file(content: str, workspace: Optional[str] = None) -> Dict[str, Any]:
     """Exact string-replacement edit of an on-disk file.
 
     content is JSON: {"path", "old_string", "new_string", "replace_all"?}.
     Fails if old_string is missing or non-unique (unless replace_all) so the
     model can't silently edit the wrong place. Returns a unified diff for the UI.
+    Confined to the workspace when one is set (same policy as write_file).
     """
     try:
         args = json.loads(content) if content.strip().startswith("{") else {}
@@ -84,9 +84,11 @@ async def _do_edit_file(content: str) -> Dict[str, Any]:
     replace_all = bool(args.get("replace_all", False))
     if not raw_path:
         return {"error": "edit_file: path required", "exit_code": 1}
-    # Confine to the same allowlist + sensitive-file policy as read/write_file.
+    # Confine to the workspace when set, else the same allowlist + sensitive-file
+    # policy as read/write_file.
     try:
-        path = _resolve_tool_path(raw_path)
+        path = (_resolve_tool_path_in_workspace(workspace, raw_path)
+                if workspace else _resolve_tool_path(raw_path))
     except ValueError as e:
         return {"error": f"edit_file: {e}", "exit_code": 1}
     if old == "":
@@ -268,6 +270,40 @@ def _resolve_tool_path(raw_path: str) -> str:
         f"path '{raw_path}' is outside the allowed roots"
     )
 
+
+def _resolve_tool_path_in_workspace(workspace: str, raw_path: str) -> str:
+    """Confine a model-supplied path to the active workspace.
+
+    Layered on top of upstream's path policy: the workspace is the allowed
+    root (relative paths resolve under it; paths that escape it are rejected),
+    and the sensitive-file deny list (.ssh, .gnupg, id_rsa, …) still applies
+    inside it. When no workspace is set, callers use _resolve_tool_path (the
+    default data/tmp allowlist) instead.
+    """
+    if raw_path is None or not str(raw_path).strip():
+        raise ValueError("path is required")
+    base = os.path.realpath(workspace)
+    expanded = os.path.expanduser(str(raw_path).strip())
+    candidate = expanded if os.path.isabs(expanded) else os.path.join(base, expanded)
+    resolved = os.path.realpath(candidate)
+    if _is_sensitive_path(resolved):
+        raise ValueError(
+            f"path '{raw_path}' is inside a sensitive directory "
+            f"(e.g. .ssh, .gnupg) or matches a sensitive filename"
+        )
+    if resolved != base:
+        # normcase so containment holds on case-insensitive filesystems
+        # (Windows, default macOS): it lowercases on Windows and is a no-op on
+        # POSIX. commonpath raises ValueError across Windows drives (C: vs D:)
+        # or mixed abs/rel — both mean "outside", so the except rejects them.
+        nbase = os.path.normcase(base)
+        try:
+            if os.path.commonpath([os.path.normcase(resolved), nbase]) != nbase:
+                raise ValueError
+        except ValueError:
+            raise ValueError(f"path '{raw_path}' is outside the workspace ({workspace})")
+    return resolved
+
 # Bash + python tools used to share a single 60s timeout. That's
 # enough for one-shot commands but starves real workloads (pip
 # install, ffmpeg conversions, etc.) — and worse, the agent saw the
@@ -310,14 +346,19 @@ _CODENAV_MAX_HITS = 200
 _CODENAV_MAX_LINE = 400
 
 
-def _resolve_search_root(raw_path: str) -> str:
+def _resolve_search_root(raw_path: str, workspace: Optional[str] = None) -> str:
     """Resolve + confine a code-nav path (grep/glob/ls).
 
-    Empty path → the agent's primary root (first allowlisted root, i.e. the
-    project data dir). A supplied path is confined by the same allowlist +
-    sensitive-file policy as read_file (_resolve_tool_path).
+    With a workspace set, the workspace folder is the root and supplied paths are
+    confined inside it (same policy as read_file). Without one, an empty path
+    defaults to the agent's primary root (project data dir) and a supplied path
+    is confined by the global allowlist + sensitive-file policy.
     """
     raw = (raw_path or "").strip()
+    if workspace:
+        if not raw:
+            return os.path.realpath(workspace)
+        return _resolve_tool_path_in_workspace(workspace, raw)
     if not raw:
         roots = _tool_path_roots()
         return roots[0] if roots else os.path.realpath(".")
@@ -512,7 +553,7 @@ def _parse_write_file(content: str) -> Dict:
     return {"path": lines[0].strip(), "content": lines[1] if len(lines) > 1 else ""}
 
 
-_MCP_ARG_PARSERS: Dict[str, callable] = {
+_MCP_ARG_PARSERS: Dict[str, Callable[[str], Dict[str, str]]] = {
     "bash":           lambda c: {"command": c},
     "python":         lambda c: {"code": c},
     "web_search":     lambda c: {"query": c.split("\n")[0].strip()},
@@ -534,11 +575,12 @@ async def _call_mcp_tool(
     tool: str,
     content: str,
     progress_cb: Optional[Callable[[Dict], Awaitable[None]]] = None,
+    workspace: Optional[str] = None,
 ) -> Dict:
     """Route a legacy tool call through the MCP manager, with direct fallbacks."""
     mcp = get_mcp_manager()
     if not mcp:
-        return await _direct_fallback(tool, content, progress_cb=progress_cb) or {"error": f"MCP manager not available for tool '{tool}'", "exit_code": 1}
+        return await _direct_fallback(tool, content, progress_cb=progress_cb, workspace=workspace) or {"error": f"MCP manager not available for tool '{tool}'", "exit_code": 1}
 
     server_id, tool_name = _MCP_TOOL_MAP[tool]
     qualified = f"mcp__{server_id}__{tool_name}"
@@ -547,11 +589,42 @@ async def _call_mcp_tool(
 
     # If MCP server not connected, try direct fallback
     if isinstance(result, dict) and result.get("exit_code") == 1 and "not connected" in result.get("error", ""):
-        fallback = await _direct_fallback(tool, content, progress_cb=progress_cb)
+        fallback = await _direct_fallback(tool, content, progress_cb=progress_cb, workspace=workspace)
         if fallback:
             return fallback
 
+    # generate_image runs as a text-only MCP tool, so the saved image URL never
+    # reaches the agent loop's structured forwarding (which renders the image via
+    # buildImageBubble on result["image_url"]). Lift it out of the tool's stdout so
+    # the image renders deterministically — no dependence on the model echoing the
+    # URL into its prose (which it mangles/hallucinates).
+    if tool == "generate_image":
+        _promote_image_fields(result)
+
     return result
+
+
+def _promote_image_fields(result: Dict) -> None:
+    """Lift the image URL (+ prompt/model/size) from a successful generate_image MCP
+    text result into structured fields the agent loop already forwards to
+    buildImageBubble. Only acts on a dict result with exit_code 0; matches the
+    generated-image URL by pattern (absolute or relative) so it's robust to the
+    result's wording."""
+    if not isinstance(result, dict) or result.get("exit_code") != 0:
+        return
+    out = result.get("stdout") or ""
+    m = re.search(r'(?:https?://[^\s)\]]+)?/api/generated-image/[A-Za-z0-9._-]+', out)
+    if not m:
+        return
+    result["image_url"] = m.group(0).strip()
+    for field, pat in (
+        ("image_prompt", r'^Generated image for:\s*(.+)$'),
+        ("image_model", r'^model:\s*(.+)$'),
+        ("image_size", r'^size:\s*(.+)$'),
+    ):
+        fm = re.search(pat, out, re.M)
+        if fm:
+            result[field] = fm.group(1).strip()
 
 
 _BG_MARKERS = {"#!bg", "#bg", "# bg", "#background", "# background", "@background", "# @background"}
@@ -574,6 +647,7 @@ async def _direct_fallback(
     tool: str,
     content: str,
     progress_cb: Optional[Callable[[Dict], Awaitable[None]]] = None,
+    workspace: Optional[str] = None,
 ) -> Optional[Dict]:
     """In-process execution path for the eight tools that used to live as
     stdio MCP servers under mcp_servers/. Those servers were deleted in
@@ -584,8 +658,6 @@ async def _direct_fallback(
     are still running, with `{elapsed_s, tail}` payloads. Other tools
     ignore it.
     """
-    import json as _json
-
     # Inherit env + force a sane terminal so subprocesses that touch
     # terminfo (anything calling `clear`, `tput`, `os.system("clear")`,
     # or scripts that probe $TERM) don't spam "TERM environment variable
@@ -609,7 +681,7 @@ async def _direct_fallback(
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 env=_subproc_env,
-                cwd=_AGENT_WORKDIR,
+                cwd=workspace or _AGENT_WORKDIR,
             )
             stdout, stderr, rc, timed_out = await _run_subprocess_streaming(
                 proc,
@@ -636,7 +708,7 @@ async def _direct_fallback(
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 env=_subproc_env,
-                cwd=_AGENT_WORKDIR,
+                cwd=workspace or _AGENT_WORKDIR,
             )
             stdout, stderr, rc, timed_out = await _run_subprocess_streaming(
                 proc,
@@ -659,14 +731,15 @@ async def _direct_fallback(
             _stripped = content.strip()
             if _stripped.startswith("{"):
                 try:
-                    _a = _json.loads(_stripped)
+                    _a = json.loads(_stripped)
                     raw_path = str(_a.get("path", "")).strip()
                     offset = int(_a.get("offset") or 0)
                     limit = int(_a.get("limit") or 0)
-                except (_json.JSONDecodeError, TypeError, ValueError):
+                except (json.JSONDecodeError, TypeError, ValueError):
                     pass
             try:
-                path = _resolve_tool_path(raw_path)
+                path = (_resolve_tool_path_in_workspace(workspace, raw_path)
+                        if workspace else _resolve_tool_path(raw_path))
             except ValueError as e:
                 return {"error": f"read_file: {e}", "exit_code": 1}
             try:
@@ -709,7 +782,8 @@ async def _direct_fallback(
             raw_path = lines[0].strip()
             body = lines[1] if len(lines) > 1 else ""
             try:
-                path = _resolve_tool_path(raw_path)
+                path = (_resolve_tool_path_in_workspace(workspace, raw_path)
+                        if workspace else _resolve_tool_path(raw_path))
             except ValueError as e:
                 return {"error": f"write_file: {e}", "exit_code": 1}
             try:
@@ -746,8 +820,8 @@ async def _direct_fallback(
             _s = (content or "").strip()
             if _s.startswith("{"):
                 try:
-                    args = _json.loads(_s)
-                except _json.JSONDecodeError:
+                    args = json.loads(_s)
+                except json.JSONDecodeError:
                     args = {}
             else:
                 args = {"pattern": _s}
@@ -762,7 +836,7 @@ async def _direct_fallback(
                 max_hits = _CODENAV_MAX_HITS
             max_hits = max(1, min(max_hits, _CODENAV_MAX_HITS))
             try:
-                root = _resolve_search_root(str(args.get("path", "")))
+                root = _resolve_search_root(str(args.get("path", "")), workspace)
             except ValueError as e:
                 return {"error": f"grep: {e}", "exit_code": 1}
 
@@ -837,8 +911,8 @@ async def _direct_fallback(
             _s = (content or "").strip()
             if _s.startswith("{"):
                 try:
-                    args = _json.loads(_s)
-                except _json.JSONDecodeError:
+                    args = json.loads(_s)
+                except json.JSONDecodeError:
                     args = {}
             else:
                 args = {"pattern": _s}
@@ -846,7 +920,7 @@ async def _direct_fallback(
             if not pattern:
                 return {"error": "glob: pattern is required", "exit_code": 1}
             try:
-                root = _resolve_search_root(str(args.get("path", "")))
+                root = _resolve_search_root(str(args.get("path", "")), workspace)
             except ValueError as e:
                 return {"error": f"glob: {e}", "exit_code": 1}
 
@@ -887,13 +961,13 @@ async def _direct_fallback(
             _s = (content or "").strip()
             if _s.startswith("{"):
                 try:
-                    raw_path = str(_json.loads(_s).get("path", "")).strip()
-                except _json.JSONDecodeError:
+                    raw_path = str(json.loads(_s).get("path", "")).strip()
+                except json.JSONDecodeError:
                     raw_path = ""
             else:
                 raw_path = _s.split("\n", 1)[0].strip()
             try:
-                root = _resolve_search_root(raw_path)
+                root = _resolve_search_root(raw_path, workspace)
             except ValueError as e:
                 return {"error": f"ls: {e}", "exit_code": 1}
 
@@ -938,7 +1012,7 @@ async def _direct_fallback(
             # Allow JSON-shaped args: {"query": "...", "time_filter": "day", "max_pages": 7}
             if raw.startswith("{"):
                 try:
-                    parsed = _json.loads(raw)
+                    parsed = json.loads(raw)
                     if isinstance(parsed, dict) and "query" in parsed:
                         query = str(parsed.get("query", "")).strip()
                         tf = parsed.get("time_filter") or parsed.get("freshness")
@@ -947,7 +1021,7 @@ async def _direct_fallback(
                         mp = parsed.get("max_pages")
                         if isinstance(mp, int) and 1 <= mp <= 10:
                             max_pages = mp
-                except _json.JSONDecodeError:
+                except json.JSONDecodeError:
                     pass
             if not query:
                 query = raw.split("\n")[0].strip()
@@ -977,7 +1051,7 @@ async def _direct_fallback(
             )
             output = text[:MAX_OUTPUT_CHARS] if len(text) > MAX_OUTPUT_CHARS else text
             if sources:
-                output += "\n\n<!-- SOURCES:" + _json.dumps(sources) + " -->"
+                output += "\n\n<!-- SOURCES:" + json.dumps(sources) + " -->"
             return {"output": output, "exit_code": 0}
 
         if tool == "web_fetch":
@@ -990,10 +1064,10 @@ async def _direct_fallback(
             # Accept either a JSON arg ({"url": "..."}) or a plain URL/domain.
             if raw.startswith("{"):
                 try:
-                    parsed = _json.loads(raw)
+                    parsed = json.loads(raw)
                     if isinstance(parsed, dict):
                         url = str(parsed.get("url") or "").strip()
-                except _json.JSONDecodeError:
+                except json.JSONDecodeError:
                     url = ""
             if not url:
                 # Non-JSON (or JSON without a usable url): take the first line
@@ -1055,8 +1129,10 @@ async def execute_tool_block(
     block: Any,
     session_id: Optional[str] = None,
     disabled_tools: Optional[set] = None,
+    tool_policy: Optional[ToolPolicy] = None,
     owner: Optional[str] = None,
     progress_cb: Optional[Callable[[Dict], Awaitable[None]]] = None,
+    workspace: Optional[str] = None,
 ) -> Tuple[str, Dict]:
     """Execute a single tool block. Returns (description, result_dict).
 
@@ -1072,6 +1148,7 @@ async def execute_tool_block(
         do_manage_documents, do_manage_settings, do_manage_notes,
         do_manage_calendar,
         do_download_model, do_serve_model, do_list_served_models, do_stop_served_model,
+        do_tail_serve_output,
         do_list_downloads, do_cancel_download, do_search_hf_models, do_list_cached_models,
         do_list_serve_presets, do_serve_preset, do_adopt_served_model,
         do_list_cookbook_servers,
@@ -1089,8 +1166,7 @@ async def execute_tool_block(
     # Return a helpful error so the model retries with the correct format.
     if tool in ("python", "json", "xml") and content.strip().startswith("{") and content.strip().endswith("}"):
         try:
-            import json as _json
-            parsed = _json.loads(content.strip())
+            parsed = json.loads(content.strip())
             if isinstance(parsed, dict):
                 desc = f"{tool}: misformatted tool call"
                 result = {
@@ -1112,6 +1188,12 @@ async def execute_tool_block(
             pass
 
     # Reject tools that the user has disabled for this request
+    if tool_policy and tool_policy.blocks(tool):
+        desc = f"{tool}: BLOCKED"
+        result = {"error": tool_policy.reason_for(tool), "exit_code": 1}
+        logger.info("Tool blocked by policy: %s", tool)
+        return desc, result
+
     if disabled_tools and tool in disabled_tools:
         desc = f"{tool}: BLOCKED"
         result = {"error": f"Tool '{tool}' is disabled by user.", "exit_code": 1}
@@ -1136,6 +1218,87 @@ async def execute_tool_block(
         logger.warning("Public tool policy blocked owner=%r tool=%s", owner, tool)
         return desc, result
 
+    # ask_user: the agent poses a multiple-choice question to the user to get a
+    # decision/clarification. This is a pure UI-control marker — no subprocess,
+    # no filesystem. It returns an `ask_user` payload that the agent loop turns
+    # into an `ask_user` SSE event and then ENDS the turn, so the chat waits for
+    # the user's selection (their choice arrives as the next message).
+    if tool == "ask_user":
+        question, options, multi = "", [], False
+        raw = (content or "").strip()
+        try:
+            parsed = json.loads(raw) if raw else {}
+        except (ValueError, TypeError):
+            parsed = {}
+        if isinstance(parsed, dict):
+            question = str(parsed.get("question", "")).strip()
+            multi = bool(parsed.get("multi") or parsed.get("multiSelect"))
+            for opt in (parsed.get("options") or []):
+                if isinstance(opt, dict):
+                    label = str(opt.get("label", "")).strip()
+                    descr = str(opt.get("description", "")).strip()
+                elif isinstance(opt, str):
+                    label, descr = opt.strip(), ""
+                else:
+                    continue
+                if label:
+                    options.append({"label": label, "description": descr})
+        else:
+            question = raw
+        if not question or len(options) < 2:
+            return "ask_user: invalid", {
+                "error": (
+                    "ask_user needs a non-empty `question` and at least 2 `options` "
+                    "(each an object with a `label`, optional `description`)."
+                ),
+                "exit_code": 1,
+            }
+        options = options[:6]  # keep the choice list sane
+        desc = f"ask_user: {question[:80]}"
+        labels = ", ".join(o["label"] for o in options)
+        result = {
+            "ask_user": {"question": question, "options": options, "multi": multi},
+            "output": f"Asked the user: {question}\nOptions: {labels}\nAwaiting their selection.",
+            "exit_code": 0,
+        }
+        logger.info("Tool executed: %s (%d options, multi=%s)", desc, len(options), multi)
+        return desc, result
+
+    # update_plan: the agent writes back to the active plan — tick an item done
+    # or revise steps (e.g. when the user asks to change something). Pure UI
+    # marker: returns a `plan_update` payload the agent loop turns into a
+    # `plan_update` SSE event; the frontend replaces the stored plan and refreshes
+    # the docked plan window. Does NOT end the turn.
+    if tool == "update_plan":
+        import json as _json
+        raw = (content or "").strip()
+        plan = ""
+        try:
+            parsed = _json.loads(raw) if raw else {}
+        except (ValueError, TypeError):
+            parsed = {}
+        if isinstance(parsed, dict) and parsed.get("plan"):
+            plan = str(parsed.get("plan", "")).strip()
+        else:
+            # Plain-string call (raw checklist) or JSON without a usable `plan`.
+            plan = raw
+        if not plan:
+            return "update_plan: invalid", {
+                "error": "update_plan needs a non-empty `plan` (the full updated checklist as markdown).",
+                "exit_code": 1,
+            }
+        plan = plan[:8192]
+        done = plan.count("- [x]") + plan.count("- [X]")
+        total = done + plan.count("- [ ]")
+        desc = f"update_plan: {done}/{total} done" if total else "update_plan"
+        result = {
+            "plan_update": {"plan": plan},
+            "output": f"Plan updated ({done}/{total} steps complete)." if total else "Plan updated.",
+            "exit_code": 0,
+        }
+        logger.info("Tool executed: %s", desc)
+        return desc, result
+
     # Background execution: a `bash` block whose first line is the `#!bg`
     # marker runs DETACHED — returns a job id immediately so the chat stream
     # isn't held open for a multi-minute install/ffmpeg/download. The always-on
@@ -1144,7 +1307,7 @@ async def execute_tool_block(
         _is_bg, _bg_cmd = _split_bg_marker(content)
         if _is_bg and _bg_cmd:
             from src import bg_jobs
-            rec = bg_jobs.launch(_bg_cmd, session_id=session_id)
+            rec = bg_jobs.launch(_bg_cmd, session_id=session_id, cwd=workspace or _AGENT_WORKDIR)
             short = _bg_cmd.strip().split(chr(10))[0][:80]
             desc = f"bash (background): {short}"
             result = {
@@ -1166,12 +1329,13 @@ async def execute_tool_block(
     if tool in _MCP_TOOL_MAP:
         first_line = content.split(chr(10))[0][:80]
         desc = f"{tool}: {first_line}"
-        result = await _call_mcp_tool(tool, content, progress_cb=progress_cb)
+        result = await _call_mcp_tool(tool, content, progress_cb=progress_cb, workspace=workspace)
     elif tool in ("grep", "glob", "ls"):
         # Code-navigation tools — no MCP server; run the direct implementation.
+        # Confined to the workspace when one is set (same policy as read_file).
         first_line = content.split(chr(10))[0][:80]
         desc = f"{tool}: {first_line}"
-        result = await _direct_fallback(tool, content, progress_cb=progress_cb) \
+        result = await _direct_fallback(tool, content, progress_cb=progress_cb, workspace=workspace) \
             or {"error": f"{tool}: execution failed", "exit_code": 1}
     elif tool == "create_document":
         title = content.split("\n")[0].strip()[:60]
@@ -1243,6 +1407,9 @@ async def execute_tool_block(
     elif tool == "stop_served_model":
         desc = "stop_served_model"
         result = await do_stop_served_model(content, owner=owner)
+    elif tool == "tail_serve_output":
+        desc = "tail_serve_output"
+        result = await do_tail_serve_output(content, owner=owner)
     elif tool == "list_downloads":
         desc = "list_downloads"
         result = await do_list_downloads(content, owner=owner)
@@ -1274,7 +1441,7 @@ async def execute_tool_block(
         desc = "edit_image"
         result = await do_edit_image(content, owner=owner)
     elif tool == "edit_file":
-        result = await _do_edit_file(content)
+        result = await _do_edit_file(content, workspace=workspace)
         desc = result.get("output") or result.get("error") or "edit_file"
     elif tool == "trigger_research":
         desc = "trigger_research"

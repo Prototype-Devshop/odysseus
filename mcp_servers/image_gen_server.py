@@ -1,7 +1,9 @@
 """
 image_gen_server.py
 
-MCP server exposing image generation via OpenAI-compatible APIs.
+MCP server exposing image generation through the canonical Odysseus
+image-generation path. The canonical path supports existing OpenAI-compatible
+image providers and media-registry providers such as ComfyUI.
 """
 
 import asyncio
@@ -78,7 +80,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         if image_url:
             text = (
                 f"Generated image for: {prompt[:100]}\n"
-                f"image_url: {image_url}\n"
+                f"Direct link: {image_url}\n"
                 f"model: {result.get('image_model', model_spec)}\n"
                 f"size: {result.get('image_size', size)}"
             )

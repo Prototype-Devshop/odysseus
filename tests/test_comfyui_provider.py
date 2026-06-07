@@ -515,6 +515,11 @@ def test_classify_endpoint_tiers():
     for url in ("http://localhost:8188", "http://127.0.0.1:8188",
                 "http://[::1]:8188", "http://box.localhost:8188"):
         assert comfyui.classify_endpoint(url) == comfyui.LOCALITY_LOOPBACK, url
+    # Docker Desktop host bridge (container → Mac/Windows host)
+    for url in ("http://host.docker.internal:8188",
+                "http://gateway.docker.internal:8188",
+                "http://HOST.DOCKER.INTERNAL:8188"):
+        assert comfyui.classify_endpoint(url) == comfyui.LOCALITY_DOCKER_HOST, url
     # private LAN / local network (allowed, but distinct from loopback)
     for url in ("http://192.168.1.50:8188", "http://10.0.0.5:8188",
                 "http://172.16.4.4:8188", "http://comfy.local:8188"):
@@ -522,6 +527,9 @@ def test_classify_endpoint_tiers():
     # public / remote
     for url in ("http://images.example.com:8188", "https://comfy.mycloud.io",
                 "http://8.8.8.8:8188"):
+        assert comfyui.classify_endpoint(url) == comfyui.LOCALITY_REMOTE, url
+    # arbitrary *.internal names are NOT docker_host — still remote
+    for url in ("http://comfy.internal:8188", "http://foo.docker.internal:8188"):
         assert comfyui.classify_endpoint(url) == comfyui.LOCALITY_REMOTE, url
     # unparseable / empty
     assert comfyui.classify_endpoint("") == comfyui.LOCALITY_UNKNOWN
@@ -532,6 +540,8 @@ def test_is_local_endpoint_classification():
         "http://localhost:8188",
         "http://127.0.0.1:8188",
         "http://[::1]:8188",
+        "http://host.docker.internal:8188",
+        "http://gateway.docker.internal:8188",
         "http://192.168.1.50:8188",
         "http://10.0.0.5:8188",
         "http://172.16.4.4:8188",
@@ -543,8 +553,20 @@ def test_is_local_endpoint_classification():
         "http://images.example.com:8188",
         "https://comfy.mycloud.io",
         "http://8.8.8.8:8188",
+        "http://comfy.internal:8188",
+        "http://foo.docker.internal:8188",
     ):
         assert comfyui.is_local_endpoint(remote) is False, remote
+
+
+def test_probe_allows_docker_host_bridge_without_remote_opt_in(monkeypatch):
+    def router(url):
+        return _FakeResp(200, {"system": {}})
+
+    _install_router(monkeypatch, router)
+    result = comfyui.probe("http://host.docker.internal:8188")
+    assert result["status"] == "online"
+    assert result["endpoint"] == "http://host.docker.internal:8188"
 
 
 def test_probe_blocks_remote_by_default(monkeypatch):

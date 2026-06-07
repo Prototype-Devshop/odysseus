@@ -15,13 +15,17 @@ Capabilities:
 
 Privacy / local-first (Gatekeeper F1/F2):
   - Media providers are **local-by-default**. Endpoints are classified into
-    three privacy tiers (``classify_endpoint``, purely syntactic — no DNS
+    privacy tiers (``classify_endpoint``, purely syntactic — no DNS
     resolution → no outbound lookups / no DNS leak):
       * loopback / local-machine (127.0.0.0/8, ::1, localhost, *.localhost)
+      * docker_host — Docker Desktop host bridge (``host.docker.internal``,
+        ``gateway.docker.internal``): the Mac/Windows host from inside a
+        container; self-hosted, not public internet
       * private LAN / local-network (RFC1918, link-local, *.local mDNS) —
         self-hosted but NOT the local machine
       * public / remote — internet-routable
-    Loopback and private-LAN are allowed by default for self-hosted use;
+    Loopback, docker_host, and private-LAN are allowed by default for
+    self-hosted use;
     ``probe()`` and ``generate()`` refuse a **public/remote** endpoint unless an
     admin enables ``allow_remote_media_providers``.
   - Agent-visible status text NEVER embeds the configured endpoint URL or raw
@@ -74,7 +78,8 @@ logger = logging.getLogger(__name__)
 PROVIDER_TYPE = "comfyui"
 
 # Admin opt-in setting (local-by-default guard). When False (the default),
-# only local endpoints (loopback / private LAN / *.local) may be contacted.
+# only local endpoints (loopback / docker_host / private LAN / *.local) may
+# be contacted.
 ALLOW_REMOTE_SETTING = "allow_remote_media_providers"
 
 # Standard ComfyUI HTTP API paths used for probing (OQ-3).
@@ -121,6 +126,9 @@ def _safe_err(e: BaseException) -> str:
 
 # Endpoint locality tiers (privacy boundary). These are deliberately distinct:
 #   - "loopback"    : same machine only (127.0.0.0/8, ::1, localhost / *.localhost)
+#   - "docker_host" : Docker Desktop host bridge — the Mac/Windows host as seen
+#                     from inside a container (`host.docker.internal`,
+#                     `gateway.docker.internal`). Self-hosted, not public DNS.
 #   - "private_lan" : local network — other hosts on a trusted LAN
 #                     (RFC1918 / link-local / *.local mDNS). NOT the local
 #                     machine, but still self-hosted / non-internet.
@@ -128,9 +136,16 @@ def _safe_err(e: BaseException) -> str:
 #                     enables `allow_remote_media_providers`.
 #   - "unknown"     : empty / unparseable endpoint.
 LOCALITY_LOOPBACK = "loopback"
+LOCALITY_DOCKER_HOST = "docker_host"
 LOCALITY_PRIVATE_LAN = "private_lan"
 LOCALITY_REMOTE = "remote"
 LOCALITY_UNKNOWN = "unknown"
+
+# Exact Docker Desktop host-bridge hostnames (no wildcard *.internal).
+DOCKER_HOST_BRIDGE_NAMES = frozenset({
+    "host.docker.internal",
+    "gateway.docker.internal",
+})
 
 
 def classify_endpoint(endpoint_url: str) -> str:
@@ -153,6 +168,8 @@ def classify_endpoint(endpoint_url: str) -> str:
 
     if host == "localhost" or host.endswith(".localhost"):
         return LOCALITY_LOOPBACK
+    if host in DOCKER_HOST_BRIDGE_NAMES:
+        return LOCALITY_DOCKER_HOST
     if host.endswith(".local"):
         return LOCALITY_PRIVATE_LAN  # mDNS name on the local network
     try:
@@ -167,13 +184,17 @@ def classify_endpoint(endpoint_url: str) -> str:
 
 
 def is_local_endpoint(endpoint_url: str) -> bool:
-    """True for self-hostable endpoints (loopback OR private LAN).
+    """True for self-hostable endpoints (loopback, docker_host, or private LAN).
 
-    Both tiers are allowed by default for self-hosted use; only public/remote
+    These tiers are allowed by default for self-hosted use; only public/remote
     endpoints are blocked unless an admin opts in. Callers that need to enforce
     a stricter loopback-only boundary should use ``classify_endpoint`` directly.
     """
-    return classify_endpoint(endpoint_url) in (LOCALITY_LOOPBACK, LOCALITY_PRIVATE_LAN)
+    return classify_endpoint(endpoint_url) in (
+        LOCALITY_LOOPBACK,
+        LOCALITY_DOCKER_HOST,
+        LOCALITY_PRIVATE_LAN,
+    )
 
 
 def _remote_media_allowed(settings: Optional[Dict[str, Any]] = None) -> bool:

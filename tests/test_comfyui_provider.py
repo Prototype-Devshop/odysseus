@@ -102,8 +102,10 @@ def test_probe_unreachable_no_fallback(monkeypatch):
     assert result["ok"] is False
     assert result["available"] is False
     assert result["status"] == "unreachable"
-    assert ENDPOINT in result["message"]
-    assert "connection refused" in (result["detail"] or "")
+    # F1: agent-visible text must not leak the endpoint URL or the raw error.
+    assert ENDPOINT not in result["message"]
+    assert "connection refused" not in (result["detail"] or "")
+    assert result["detail"] == "ConnectError"  # leak-safe (type name only)
     # Network errors are terminal — must NOT retry the fallback path.
     assert len(calls) == 1
 
@@ -180,8 +182,9 @@ def test_module_probe_helper_prefers_explicit_url(monkeypatch):
         return _FakeResp(200, {"system": {}})
 
     _install_router(monkeypatch, router)
-    result = comfyui.probe("http://explicit:8188")
-    assert result["endpoint"] == "http://explicit:8188"
+    # Use a loopback URL so the local-by-default guard allows the probe.
+    result = comfyui.probe("http://127.0.0.1:8188")
+    assert result["endpoint"] == "http://127.0.0.1:8188"
     assert result["status"] == "online"
 
 
@@ -431,3 +434,147 @@ def test_bundled_workflow_loads_and_has_placeholders():
     flat = str(wf)
     for token in (comfyui.PH_PROMPT, comfyui.PH_SEED, comfyui.PH_WIDTH, comfyui.PH_HEIGHT):
         assert token in flat
+
+
+# F2: local-by-default endpoint enforcement ---------------------------------
+
+REMOTE_ENDPOINT = "http://images.example.com:8188"
+
+
+def test_classify_endpoint_tiers():
+    # loopback / local machine
+    for url in ("http://localhost:8188", "http://127.0.0.1:8188",
+                "http://[::1]:8188", "http://box.localhost:8188"):
+        assert comfyui.classify_endpoint(url) == comfyui.LOCALITY_LOOPBACK, url
+    # private LAN / local network (allowed, but distinct from loopback)
+    for url in ("http://192.168.1.50:8188", "http://10.0.0.5:8188",
+                "http://172.16.4.4:8188", "http://comfy.local:8188"):
+        assert comfyui.classify_endpoint(url) == comfyui.LOCALITY_PRIVATE_LAN, url
+    # public / remote
+    for url in ("http://images.example.com:8188", "https://comfy.mycloud.io",
+                "http://8.8.8.8:8188"):
+        assert comfyui.classify_endpoint(url) == comfyui.LOCALITY_REMOTE, url
+    # unparseable / empty
+    assert comfyui.classify_endpoint("") == comfyui.LOCALITY_UNKNOWN
+
+
+def test_is_local_endpoint_classification():
+    for local in (
+        "http://localhost:8188",
+        "http://127.0.0.1:8188",
+        "http://[::1]:8188",
+        "http://192.168.1.50:8188",
+        "http://10.0.0.5:8188",
+        "http://172.16.4.4:8188",
+        "http://comfy.local:8188",
+        "http://box.localhost:8188",
+    ):
+        assert comfyui.is_local_endpoint(local) is True, local
+    for remote in (
+        "http://images.example.com:8188",
+        "https://comfy.mycloud.io",
+        "http://8.8.8.8:8188",
+    ):
+        assert comfyui.is_local_endpoint(remote) is False, remote
+
+
+def test_probe_blocks_remote_by_default(monkeypatch):
+    def boom(url, timeout=None):
+        raise AssertionError("must not contact a remote endpoint when disallowed")
+
+    monkeypatch.setattr(comfyui.httpx, "get", boom)
+    result = ComfyUIProvider(REMOTE_ENDPOINT, allow_remote=False).probe()
+
+    assert result["ok"] is False
+    assert result["status"] == "remote_blocked"
+    # F1: the blocked message must not leak the (remote) URL.
+    text = media_registry.format_degraded_message(result)
+    assert REMOTE_ENDPOINT not in text
+    assert "example.com" not in text
+
+
+def test_generate_blocks_remote_by_default(monkeypatch):
+    def boom(*a, **k):
+        raise AssertionError("must not contact a remote endpoint when disallowed")
+
+    monkeypatch.setattr(comfyui.httpx, "post", boom)
+    monkeypatch.setattr(comfyui.httpx, "get", boom)
+    result = ComfyUIProvider(REMOTE_ENDPOINT, allow_remote=False).generate(prompt="x", seed=1)
+
+    assert result["ok"] is False
+    assert result["status"] == "remote_blocked"
+    assert "example.com" not in media_registry.format_degraded_message(result)
+
+
+def test_remote_allowed_when_explicitly_enabled(monkeypatch):
+    def post(url, body):
+        return _FakeResp(200, {"prompt_id": "p"})
+
+    def get(url, params):
+        if "/history/" in url:
+            return _FakeResp(200, _history_with_image("p"))
+        return _FakeBytesResp(200, b"IMG")
+
+    _install_generation_router(monkeypatch, post=post, get=get)
+    result = ComfyUIProvider(REMOTE_ENDPOINT, allow_remote=True).generate(prompt="x", seed=1)
+
+    assert result["ok"] is True
+    assert result["status"] == "generated"
+
+
+def test_remote_allow_resolves_from_settings(monkeypatch):
+    # allow_remote=None → provider reads the setting; default-missing means blocked.
+    monkeypatch.setattr(comfyui, "_remote_media_allowed", lambda settings=None: False)
+
+    def boom(*a, **k):
+        raise AssertionError("must not contact remote endpoint")
+
+    monkeypatch.setattr(comfyui.httpx, "post", boom)
+    result = ComfyUIProvider(REMOTE_ENDPOINT).generate(prompt="x", seed=1)
+    assert result["status"] == "remote_blocked"
+
+
+# F1: provider errors never leak the endpoint URL ---------------------------
+
+def test_generate_errors_never_leak_endpoint_url(monkeypatch):
+    secret_local = "http://127.0.0.1:9999"
+
+    # unreachable
+    def post_unreach(url, body):
+        raise httpx.ConnectError("connect to 127.0.0.1:9999 failed")
+
+    _install_generation_router(monkeypatch, post=post_unreach, get=lambda *a: None)
+    r1 = ComfyUIProvider(secret_local).generate(prompt="x", seed=1)
+    t1 = media_registry.format_degraded_message(r1)
+    assert r1["status"] == "unreachable"
+    assert "127.0.0.1" not in t1 and "9999" not in t1
+
+    # generation_failed (queue HTTP error)
+    _install_generation_router(monkeypatch, post=lambda u, b: _FakeResp(500, {}), get=lambda *a: None)
+    r2 = ComfyUIProvider(secret_local).generate(prompt="x", seed=1)
+    t2 = media_registry.format_degraded_message(r2)
+    assert r2["status"] == "generation_failed"
+    assert "127.0.0.1" not in t2 and "9999" not in t2
+
+
+# F4: prompt_id is URL-encoded before path interpolation ---------------------
+
+def test_history_prompt_id_is_url_encoded(monkeypatch):
+    weird_id = "a b/../c?x=1"
+
+    def post(url, body):
+        return _FakeResp(200, {"prompt_id": weird_id})
+
+    def get(url, params):
+        if "/history/" in url:
+            # The raw id (with spaces / slashes / query chars) must not appear
+            # verbatim in the request path.
+            assert " " not in url
+            assert "?" not in url.split("/history/")[1]
+            assert "a%20b" in url  # space encoded
+            return _FakeResp(200, _history_with_image(weird_id))
+        return _FakeBytesResp(200, b"IMG")
+
+    _install_generation_router(monkeypatch, post=post, get=get)
+    result = ComfyUIProvider(ENDPOINT).generate(prompt="x", seed=1, poll_interval=0)
+    assert result["ok"] is True

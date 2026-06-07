@@ -42,6 +42,12 @@ DEFAULT_SETTINGS = {
     "media_models": [],
     "default_image_media_model": "",
     "comfyui_endpoint_url": "",
+    # Privacy / local-first guard: media providers are local-by-default.
+    # Loopback (local machine) and private-LAN (local network) endpoints are
+    # allowed; only PUBLIC/remote (internet-routable) media endpoints are
+    # refused unless an admin explicitly opts in here. See
+    # services/media/comfyui.py (classify_endpoint).
+    "allow_remote_media_providers": False,
     "vision_model": "",
     "vision_enabled": True,
     # Ordered fallback chain for the Vision model (image analysis, OCR, tagging).

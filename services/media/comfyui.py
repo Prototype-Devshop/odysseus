@@ -1,19 +1,38 @@
 # services/media/comfyui.py
-"""ComfyUI media provider — connection probe only (Slice 3).
+"""ComfyUI media provider — connection probe + text-to-image generation.
 
 Isolated provider module for the media generation layer, modeled on the
 existing single-responsibility service modules (``services/tts``,
 ``services/stt``). It is deliberately kept out of ``src/ai_interaction.py`` so
 provider code stays separate from the agent/tool plumbing.
 
-Scope of this slice (S3): answer three questions and nothing more —
-  1. Can we reach ComfyUI?
-  2. What did we check (which probe path)?
-  3. What status should the agent / user see?
+Capabilities:
+  - ``probe()``  — reachability check (S3): can we reach ComfyUI, via which
+    path, and what status should the admin see?
+  - ``generate()`` — text-to-image (S4B): queue a workflow (``POST /prompt``),
+    poll ``GET /history/{id}`` (bounded), and retrieve ``GET /view``. Returns
+    raw image bytes; persistence/metadata are the caller's responsibility.
 
-Generation (``POST /prompt``), polling (``GET /history/{id}``), and output
-retrieval (``GET /view``) are intentionally NOT implemented here; they arrive
-in S4.
+Privacy / local-first (Gatekeeper F1/F2):
+  - Media providers are **local-by-default**. Endpoints are classified into
+    three privacy tiers (``classify_endpoint``, purely syntactic — no DNS
+    resolution → no outbound lookups / no DNS leak):
+      * loopback / local-machine (127.0.0.0/8, ::1, localhost, *.localhost)
+      * private LAN / local-network (RFC1918, link-local, *.local mDNS) —
+        self-hosted but NOT the local machine
+      * public / remote — internet-routable
+    Loopback and private-LAN are allowed by default for self-hosted use;
+    ``probe()`` and ``generate()`` refuse a **public/remote** endpoint unless an
+    admin enables ``allow_remote_media_providers``.
+  - Agent-visible status text NEVER embeds the configured endpoint URL or raw
+    exception strings; those stay in the structured ``endpoint`` field (admin
+    contexts only) and in server-side logs. The ``endpoint`` field is never
+    returned through any agent/LLM/tool output path.
+
+Note: the bundled workflow uses a ``%checkpoint%`` placeholder that is only
+substituted when a checkpoint name is supplied. Until a checkpoint is wired
+through, live generation against a real ComfyUI will fail at the model-load
+step (a known live-test limitation, not a code defect).
 
 Probe strategy (per resolved OQ-3):
   - ``GET /system_stats`` first (cheap, returns a small JSON dict).
@@ -37,12 +56,14 @@ the probe path that answered).
 from __future__ import annotations
 
 import copy
+import ipaddress
 import json
 import logging
 import random
 import time
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional, Tuple
+from urllib.parse import quote, urlparse
 
 import httpx
 
@@ -51,6 +72,10 @@ from src import media_registry
 logger = logging.getLogger(__name__)
 
 PROVIDER_TYPE = "comfyui"
+
+# Admin opt-in setting (local-by-default guard). When False (the default),
+# only local endpoints (loopback / private LAN / *.local) may be contacted.
+ALLOW_REMOTE_SETTING = "allow_remote_media_providers"
 
 # Standard ComfyUI HTTP API paths used for probing (OQ-3).
 PROBE_PRIMARY_PATH = "/system_stats"
@@ -87,6 +112,80 @@ _DEFAULT_WORKFLOW_PATH = Path(__file__).resolve().parent / "workflows" / "text_t
 
 # Suggested default endpoint surfaced in guidance (mirrors media_registry).
 SUGGESTED_ENDPOINT = media_registry.SUGGESTED_COMFYUI_ENDPOINT
+
+
+def _safe_err(e: BaseException) -> str:
+    """A leak-safe description of an exception (type name only, no message/URL)."""
+    return type(e).__name__
+
+
+# Endpoint locality tiers (privacy boundary). These are deliberately distinct:
+#   - "loopback"    : same machine only (127.0.0.0/8, ::1, localhost / *.localhost)
+#   - "private_lan" : local network — other hosts on a trusted LAN
+#                     (RFC1918 / link-local / *.local mDNS). NOT the local
+#                     machine, but still self-hosted / non-internet.
+#   - "remote"      : public / internet-routable → blocked unless an admin
+#                     enables `allow_remote_media_providers`.
+#   - "unknown"     : empty / unparseable endpoint.
+LOCALITY_LOOPBACK = "loopback"
+LOCALITY_PRIVATE_LAN = "private_lan"
+LOCALITY_REMOTE = "remote"
+LOCALITY_UNKNOWN = "unknown"
+
+
+def classify_endpoint(endpoint_url: str) -> str:
+    """Classify an endpoint's privacy tier (purely syntactic — no DNS lookups).
+
+    No name resolution is performed, so this makes no outbound calls and cannot
+    leak a hostname via a lookup. Unknown public hostnames are treated as remote
+    so they require an explicit admin opt-in. Returns one of LOCALITY_*.
+    """
+    if not endpoint_url:
+        return LOCALITY_UNKNOWN
+    raw = endpoint_url if "://" in endpoint_url else "http://" + endpoint_url
+    try:
+        host = urlparse(raw).hostname
+    except Exception:
+        return LOCALITY_UNKNOWN
+    if not host:
+        return LOCALITY_UNKNOWN
+    host = host.strip().rstrip(".").lower()
+
+    if host == "localhost" or host.endswith(".localhost"):
+        return LOCALITY_LOOPBACK
+    if host.endswith(".local"):
+        return LOCALITY_PRIVATE_LAN  # mDNS name on the local network
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return LOCALITY_REMOTE  # a non-local hostname → treat as remote
+    if ip.is_loopback:
+        return LOCALITY_LOOPBACK
+    if ip.is_private or ip.is_link_local:
+        return LOCALITY_PRIVATE_LAN
+    return LOCALITY_REMOTE
+
+
+def is_local_endpoint(endpoint_url: str) -> bool:
+    """True for self-hostable endpoints (loopback OR private LAN).
+
+    Both tiers are allowed by default for self-hosted use; only public/remote
+    endpoints are blocked unless an admin opts in. Callers that need to enforce
+    a stricter loopback-only boundary should use ``classify_endpoint`` directly.
+    """
+    return classify_endpoint(endpoint_url) in (LOCALITY_LOOPBACK, LOCALITY_PRIVATE_LAN)
+
+
+def _remote_media_allowed(settings: Optional[Dict[str, Any]] = None) -> bool:
+    """Whether remote media providers are explicitly enabled by an admin."""
+    cfg = settings
+    if cfg is None:
+        try:
+            from src.settings import load_settings
+            cfg = load_settings()
+        except Exception:  # pragma: no cover - settings unavailable at boot
+            cfg = {}
+    return bool(cfg.get(ALLOW_REMOTE_SETTING, False))
 
 
 def _safe_progress(progress_cb: Optional[Callable[[str], Any]], message: str) -> None:
@@ -187,9 +286,12 @@ class ComfyUIProvider:
         self,
         endpoint_url: Optional[str] = None,
         timeout: float = DEFAULT_PROBE_TIMEOUT,
+        allow_remote: Optional[bool] = None,
     ):
         self.endpoint_url = (endpoint_url or "").strip()
         self.timeout = timeout
+        # None → resolve lazily from settings; bool → explicit (tests/callers).
+        self.allow_remote = allow_remote
 
     @classmethod
     def from_settings(
@@ -209,7 +311,26 @@ class ComfyUIProvider:
             except Exception:  # pragma: no cover - settings unavailable at boot
                 settings = {}
         url = settings.get("comfyui_endpoint_url") or ""
-        return cls(endpoint_url=url, timeout=timeout)
+        return cls(
+            endpoint_url=url,
+            timeout=timeout,
+            allow_remote=bool(settings.get(ALLOW_REMOTE_SETTING, False)),
+        )
+
+    # ── Local-by-default guard ──
+
+    def _remote_ok(self) -> bool:
+        if self.allow_remote is not None:
+            return self.allow_remote
+        return _remote_media_allowed()
+
+    def _remote_guard(self) -> Optional[Dict[str, Any]]:
+        """Return a degraded result if the endpoint is remote and not allowed."""
+        if is_local_endpoint(self.endpoint_url):
+            return None
+        if self._remote_ok():
+            return None
+        return self._remote_blocked()
 
     # ── HTTP ──
 
@@ -226,7 +347,9 @@ class ComfyUIProvider:
         try:
             resp = httpx.get(url, timeout=self.timeout)
         except (httpx.RequestError, OSError) as e:
-            return ("network_error", None, str(e))
+            # Keep the raw error in logs only; never surface it (may carry host).
+            logger.debug("comfyui: probe network error: %s", e)
+            return ("network_error", None, _safe_err(e))
 
         code = getattr(resp, "status_code", None)
         if code in (401, 403):
@@ -249,6 +372,10 @@ class ComfyUIProvider:
         endpoint = self.endpoint_url
         if not endpoint:
             return self._not_configured()
+
+        blocked = self._remote_guard()
+        if blocked is not None:
+            return blocked
 
         base = endpoint.rstrip("/")
 
@@ -304,6 +431,11 @@ class ComfyUIProvider:
         endpoint = self.endpoint_url
         if not endpoint:
             return self._not_configured()
+
+        blocked = self._remote_guard()
+        if blocked is not None:
+            return blocked
+
         base = endpoint.rstrip("/")
 
         if seed is None:
@@ -322,7 +454,8 @@ class ComfyUIProvider:
         try:
             resp = httpx.post(base + QUEUE_PATH, json={"prompt": wf}, timeout=REQUEST_TIMEOUT)
         except (httpx.RequestError, OSError) as e:
-            return self._unreachable(detail=str(e))
+            logger.debug("comfyui: queue network error: %s", e)
+            return self._unreachable(detail=_safe_err(e))
         code = getattr(resp, "status_code", None)
         if code in (401, 403):
             return self._auth_error(code)
@@ -337,14 +470,19 @@ class ComfyUIProvider:
             return self._generation_failed(detail="ComfyUI did not return a prompt_id")
 
         # 2) Poll history until the job appears (bounded wall-clock budget).
+        # prompt_id comes from the provider; URL-encode it before path use so a
+        # hostile/odd value cannot alter the request shape (it stays in-path —
+        # it cannot change host, so this is hardening, not an SSRF fix).
+        prompt_id_q = quote(str(prompt_id), safe="")
         deadline = time.monotonic() + timeout
         history_entry = None
         while time.monotonic() < deadline:
             _safe_progress(progress_cb, "Waiting for ComfyUI to finish…")
             try:
-                hresp = httpx.get(f"{base}{HISTORY_PATH}/{prompt_id}", timeout=REQUEST_TIMEOUT)
+                hresp = httpx.get(f"{base}{HISTORY_PATH}/{prompt_id_q}", timeout=REQUEST_TIMEOUT)
             except (httpx.RequestError, OSError) as e:
-                return self._unreachable(detail=str(e))
+                logger.debug("comfyui: history network error: %s", e)
+                return self._unreachable(detail=_safe_err(e))
             hcode = getattr(hresp, "status_code", None)
             if isinstance(hcode, int) and 200 <= hcode < 300:
                 try:
@@ -369,7 +507,8 @@ class ComfyUIProvider:
         try:
             vresp = httpx.get(base + VIEW_PATH, params=image_ref, timeout=REQUEST_TIMEOUT)
         except (httpx.RequestError, OSError) as e:
-            return self._unreachable(detail=str(e))
+            logger.debug("comfyui: view network error: %s", e)
+            return self._unreachable(detail=_safe_err(e))
         vcode = getattr(vresp, "status_code", None)
         if not (isinstance(vcode, int) and 200 <= vcode < 300):
             return self._generation_failed(detail=f"image retrieval returned HTTP {vcode}")
@@ -437,6 +576,11 @@ class ComfyUIProvider:
         base["via"] = via
         return base
 
+    # NOTE (Gatekeeper F1): builder ``message`` / ``next_steps`` / ``detail`` are
+    # rendered to the agent (and may reach a remote LLM). They must NEVER contain
+    # ``self.endpoint_url`` or a raw exception string. The endpoint is preserved
+    # only in the structured ``endpoint`` field (admin contexts) and in logs.
+
     def _online(self, *, via: str, data: Dict[str, Any]) -> Dict[str, Any]:
         version = None
         try:
@@ -447,7 +591,7 @@ class ComfyUIProvider:
         return self._result(
             "online",
             ok=True,
-            message=f"ComfyUI is reachable at {self.endpoint_url}.",
+            message="ComfyUI is reachable at the configured endpoint.",
             checked_status=f"online (via {via})",
             detail=detail,
             via=via,
@@ -465,14 +609,29 @@ class ComfyUIProvider:
             ],
         )
 
+    def _remote_blocked(self) -> Dict[str, Any]:
+        return self._result(
+            "remote_blocked",
+            ok=False,
+            message=(
+                "This media provider endpoint is remote, and remote media "
+                "providers are disabled by default for privacy."
+            ),
+            checked_status="blocked (remote endpoint; remote providers disabled)",
+            next_steps=[
+                "Use a local ComfyUI endpoint (localhost, loopback, or a private LAN address), or",
+                f"ask an admin to enable '{ALLOW_REMOTE_SETTING}' to allow remote media providers.",
+            ],
+        )
+
     def _unreachable(self, *, detail: Optional[str]) -> Dict[str, Any]:
         return self._result(
             "unreachable",
             ok=False,
-            message=f"ComfyUI is configured but unavailable at {self.endpoint_url}.",
+            message="ComfyUI is configured but unavailable at the configured endpoint.",
             checked_status="unreachable",
             next_steps=[
-                f"Start ComfyUI and ensure it is listening at {self.endpoint_url}.",
+                "Start ComfyUI and ensure it is listening at the configured endpoint.",
                 "Verify the endpoint URL (comfyui_endpoint_url) in settings.",
                 "Run the provider probe again.",
             ],
@@ -483,7 +642,7 @@ class ComfyUIProvider:
         return self._result(
             "auth_error",
             ok=False,
-            message=f"ComfyUI at {self.endpoint_url} rejected the request (HTTP {code}).",
+            message=f"The configured ComfyUI endpoint rejected the request (HTTP {code}).",
             checked_status=f"auth error (HTTP {code})",
             next_steps=[
                 "Check whether the ComfyUI endpoint requires authentication or is behind a proxy.",
@@ -506,7 +665,7 @@ class ComfyUIProvider:
         return self._result(
             "unavailable",
             ok=False,
-            message=f"ComfyUI at {self.endpoint_url} responded but the probe did not succeed.",
+            message="The configured ComfyUI endpoint responded but the probe did not succeed.",
             checked_status="unavailable",
             next_steps=[
                 f"Confirm the endpoint URL points at a ComfyUI server (suggested: {SUGGESTED_ENDPOINT}).",
@@ -520,7 +679,7 @@ class ComfyUIProvider:
         return self._result(
             "generation_failed",
             ok=False,
-            message=f"ComfyUI could not complete the image generation at {self.endpoint_url}.",
+            message="ComfyUI could not complete the image generation.",
             checked_status="generation failed",
             next_steps=[
                 "Check the ComfyUI server logs for the failed prompt.",
@@ -546,7 +705,7 @@ class ComfyUIProvider:
             "timeout",
             ok=False,
             message=(
-                f"ComfyUI did not finish the image within {int(timeout)}s at {self.endpoint_url}."
+                f"ComfyUI did not finish the image within {int(timeout)}s."
             ),
             checked_status="timeout",
             next_steps=[

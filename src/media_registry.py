@@ -339,7 +339,7 @@ def default_image_model_or_degraded(
             ),
             checked=_checked_image_providers(cfg),
             next_steps=[
-                f"Configure a ComfyUI endpoint (suggested: {SUGGESTED_COMFYUI_ENDPOINT}).",
+                "Configure a local ComfyUI endpoint in settings.",
                 "Register or select an image workflow/model.",
                 "Run the provider probe again.",
             ],

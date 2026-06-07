@@ -86,6 +86,7 @@ _AGENT_RULES = """\
 - User identity facts/preferences ("my name is <name>", "I live in <place>", "I prefer concise replies", "call me <name>") → use `manage_memory` with action=add. NEVER use `manage_contact` for facts about the user unless the user explicitly says to create/update a contact and provides contact details such as an email or phone.
 - "Create/add/write a note" / "notes" / "todos" / "remind me to X at <time>" → use `manage_notes`. Do NOT store notes in `manage_memory`; memory is for persistent facts/preferences about the user, not note content. For reminders, include a `due_date`; for todos, use `note_type=checklist` when appropriate.
 - "Do X every morning / daily / on a schedule / automatically" (e.g. "summarize my inbox every morning") → this is a request to CREATE A SCHEDULED TASK, not to do X once right now. Call `manage_tasks` with action=create (prompt = what to do, schedule + cron/time). Do NOT just perform the action inline this turn — the user wants it to recur. After creating, return a clickable `[Task name](#task-<id>)` link and tell them it'll run on schedule and show in the Tasks panel. If you also want to show a sample of this run, do that AFTER creating the task, not instead of it.
+- "Can you make/draw/generate images?" / "Do you support image generation?" / "What image models are available?" → call ```list_media_models``` FIRST. There is no `draw` tool — never invent one. Answer only from the tool result: if no models are configured, relay the degraded-state message; do not claim image generation works until the tool confirms models are available.
 
 ## UI conventions
 - When you reference an entity by ID in your reply, render it as a STANDARD markdown link with a hash-prefixed anchor. The frontend converts these into clickable jump buttons:
@@ -128,6 +129,7 @@ _API_AGENT_RULES = """\
 - Calendar: call `manage_calendar` with `action=list_calendars` FIRST before create/update/delete operations.
 - "Create/add/write a note" / "notes" / "todos" / "remind me to X at <time>" → use `manage_notes`. Do NOT store notes in `manage_memory`; memory is for persistent facts/preferences about the user, not note content. For reminders, include a `due_date`; for todos, use `note_type=checklist` when appropriate. `manage_tasks` is for RECURRING background AI jobs, NOT for one-off user reminders.
 - "Disable/turn off/enable/turn on <tool>" (shell, search, research, browser, documents, incognito, etc.) → call `ui_control` with `toggle <name> <on|off>`. Aliases accepted: shell→bash, search→web, deepresearch→research, documents→document_editor. NEVER record this as a memory — the user wants the toggle flipped, not a note about preferring it.
+- "Can you make/draw/generate images?" / "Do you support image generation?" / "What image models are available?" → call `list_media_models` FIRST. There is no `draw` tool — never invent one. Answer only from the tool result: if no models are configured, relay the degraded-state message; do not claim image generation works until the tool confirms models are available.
 - "Research X" / "do research on X" / "look into Y" / "deep dive on Z" → call `trigger_research` with `topic`. This starts a live job that appears in the Deep Research sidebar (streams progress + final report). **Do NOT use `web_search` for these** — saw the agent do a plain web_search for "do research on X" when the user wanted the deep-research job. "research X" is a deep-research request, not a quick lookup. (web_search is only for a single quick fact mid-task.) Do NOT POST /api/research/start via app_api either — blocked. After starting, tell the user it's running in the Deep Research sidebar. Only if the user explicitly wants it inline/quick should you fall back to web_search.
 - "Open/show <panel>" (documents, library, gallery, email, inbox, sessions, brain/memories, skills, settings, notes, cookbook) → call `ui_control` with `open_panel <name>`. Panel aliases: library/doc/docs/document→documents, images→gallery, mail/inbox/emails→email, chats/history→sessions, memory/memories→brain, preferences→settings, models/serve/serving→cookbook. CRITICAL: "open memory/memories/brain" / "open skills" / "open notes" / "open documents" / "open cookbook" means OPEN THE PANEL — call `ui_control`, NOT a manage/list tool. The "manage_*" tools list contents in chat; `ui_control open_panel` opens the visual modal the user is asking for.
 - "Open/start a reply", "open a reply to <sender>", "draft a reply window" for email → find/read the email if needed, then call `ui_control` with `open_email_reply <uid> <folder> reply`. This opens the same email document compose window as clicking Reply in the Email UI. Do NOT call `reply_to_email` unless the user explicitly gave body text and wants to SEND immediately.
@@ -278,7 +280,7 @@ Suggest changes with explanations (for review/feedback requests).""",
 ```
 Generate an image. Line 1 = description, line 2 = model name, line 3 = WxH (e.g. 1024x1024), line 4 = quality.""",
 
-    "list_media_models": "- ```list_media_models``` — List configured, enabled image-generation models and which is the default. Optional line 1 = kind (image/video; default image). Call this when the user asks whether you can make images or what image models are available, BEFORE generate_image — never guess model names.",
+    "list_media_models": "- ```list_media_models``` — List configured, enabled image-generation models and which is the default. Optional line 1 = kind (image/video; default image). ALWAYS call this FIRST when the user asks whether you can make/draw/generate images or what image models are available. There is no `draw` tool. Report the tool result — if no models are configured, relay the degraded-state message instead of claiming support. Only call ```generate_image``` after models are confirmed.",
     "chat_with_model": "- ```chat_with_model``` — Ask a DIFFERENT AI model and relay its answer. Line 1 = model name (or 'model@endpoint'), rest = your message. Use when the user says 'ask <model>', 'what does <model> think', or wants to compare/their answer from another model.",
     "ask_teacher": "- ```ask_teacher``` — Escalate a hard question to a more capable model. Line 1 = model name or 'auto', rest = the question. Use when stuck or need expert knowledge.",
     "list_models": "- ```list_models``` — Show all available AI models across all endpoints. Use when user asks what models are available.",
@@ -1551,12 +1553,9 @@ async def stream_agent_loop(
     # Fallback: if RAG unavailable, use keyword-based tool selection
     # instead of sending ALL tools (which overwhelms the model).
     if not guide_only and not _relevant_tools and _retrieval_query:
-        from src.tool_index import ALWAYS_AVAILABLE, ToolIndex
+        from src.tool_index import ALWAYS_AVAILABLE, keyword_hint_tools
         _relevant_tools = set(ALWAYS_AVAILABLE)
-        ql = _retrieval_query.lower()
-        for keywords, tools in ToolIndex._KEYWORD_HINTS.items():
-            if any(kw in ql for kw in keywords):
-                _relevant_tools.update(tools)
+        _relevant_tools.update(keyword_hint_tools(_retrieval_query))
         # Always include core document/memory tools
         _relevant_tools.update({"create_document", "manage_memory", "manage_notes"})
         logger.info(f"[tool-rag] Keyword fallback selected: {sorted(_relevant_tools - ALWAYS_AVAILABLE)}")

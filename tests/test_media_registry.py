@@ -251,6 +251,9 @@ def test_format_degraded_message_renders_block():
     assert "Next steps:" in text
     assert "- comfyui:" in text
     assert "1." in text
+    assert "Configure a local ComfyUI endpoint in settings." in text
+    assert "8188" not in text
+    assert "://" not in text
 
 
 # ── Settings integration ──

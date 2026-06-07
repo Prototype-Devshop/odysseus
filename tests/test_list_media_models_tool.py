@@ -84,14 +84,26 @@ def test_tool_index_description_present():
     assert "list_media_models" in BUILTIN_TOOL_DESCRIPTIONS
 
 
-def test_keyword_hint_surfaces_media_tools():
-    # An image-intent query should force-include both discovery + generation.
-    hinted = set()
-    for keys, tools in ToolIndex._KEYWORD_HINTS.items():
-        if any("image" in k for k in keys):
-            hinted |= tools
-    assert "list_media_models" in hinted
-    assert "generate_image" in hinted
+def test_keyword_hint_capability_queries_surface_discovery_only():
+    ti = ToolIndex.__new__(ToolIndex)
+    ti.retrieve = lambda query, k=8: []
+    for q in (
+        "Can you make images?",
+        "Can you draw?",
+        "Do you support image generation?",
+        "Can you generate pictures?",
+    ):
+        tools = ti.get_tools_for_query(q)
+        assert "list_media_models" in tools, q
+        assert "generate_image" not in tools, q
+
+
+def test_keyword_hint_creation_intent_surfaces_both_tools():
+    ti = ToolIndex.__new__(ToolIndex)
+    ti.retrieve = lambda query, k=8: []
+    tools = ti.get_tools_for_query("generate an image of a mountain at sunset")
+    assert "list_media_models" in tools
+    assert "generate_image" in tools
 
 
 # ── Implementation contract ──
@@ -132,6 +144,10 @@ async def test_degraded_when_no_models(monkeypatch):
     assert result["models"] == []
     assert "no image model" in result["results"].lower()
     assert "Next steps:" in result["results"]
+    # Agent-visible guidance must not leak a concrete endpoint URL.
+    assert "8188" not in result["results"]
+    assert "://" not in result["results"]
+    assert "Configure a local ComfyUI endpoint in settings." in result["results"]
 
 
 async def test_disabled_models_excluded(monkeypatch):

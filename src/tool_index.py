@@ -104,8 +104,8 @@ BUILTIN_TOOL_DESCRIPTIONS: Dict[str, str] = {
     "edit_document": "Preferred tool for editing an existing document — targeted find-and-replace. Use for any small change: add a function, fix a bug, tweak a section, rename things.",
     "update_document": "Replace the entire active document content. ONLY for full rewrites (>50% changed). Do not use for small edits — use edit_document instead.",
     "suggest_document": "Suggest changes to the active document with explanations. For code review, proofreading, feedback requests.",
-    "generate_image": "Generate an AI image from a text prompt. Specify model, size, and quality. Art, illustrations, photos.",
-    "list_media_models": "List configured and enabled media generation models (image models) and their capabilities, including which is the default. Use to discover available image models before generating — e.g. 'can you make images?', 'what image models are available?'. Avoids guessing unconfigured model names.",
+    "generate_image": "Generate an AI image from a text prompt. Specify model, size, and quality. Art, illustrations, photos. There is no separate 'draw' tool — use generate_image for creation after list_media_models confirms a model is configured.",
+    "list_media_models": "List configured and enabled media generation models (image models) and their capabilities, including which is the default. ALWAYS call this FIRST when the user asks whether you can make/draw/generate images or what image models are available — e.g. 'can you make images?', 'can you draw?', 'do you support image generation?'. Report the tool result; if no models are configured, relay the degraded-state message. Never invent a 'draw' tool or guess model names like Stable Diffusion.",
     "chat_with_model": "Send a message to a different AI model. Compare responses, get specialized help, delegate tasks.",
     "ask_teacher": "Ask a more capable model for help with a difficult problem. Escalate complex tasks.",
     "pipeline": "Run a multi-step AI pipeline with multiple models. Chain tasks together in sequence.",
@@ -158,6 +158,40 @@ BUILTIN_TOOL_DESCRIPTIONS: Dict[str, str] = {
     "edit_image": "Edit an image in the gallery: upscale (increase resolution), remove background (rembg), inpaint (fill selected area), or harmonize (blend edits). Specify image ID and action.",
     "trigger_research": "Start a deep research job on any topic — appears in the Deep Research sidebar, streams progress, produces a detailed report. Use for 'research X', 'look into Y', 'do deep research on Z', 'investigate'. NOT a scheduled task — it runs now and surfaces in the sidebar.",
 }
+
+# Image tool keyword hints (kept separate so capability questions take precedence
+# over broad creation keywords like bare "images").
+_IMAGE_CAPABILITY_HINTS = frozenset({
+    "can you make images", "can you make pictures",
+    "can you make an image", "can you create images",
+    "can you draw", "can you generate images",
+    "can you generate pictures", "do you support image",
+    "support image generation", "image generation available",
+    "what image models", "image models available",
+    "generate pictures", "generate images",
+})
+_IMAGE_CREATION_HINTS = frozenset({
+    "image", "images", "picture", "pictures", "photo", "art",
+    "illustration", "render", "make an image",
+    "generate an image", "create an image", "image model",
+    "image models", "media models", "draw a", "draw me",
+})
+
+
+def keyword_hint_tools(query: str) -> Set[str]:
+    """Return tool names force-included by keyword hints for *query*."""
+    ql = (query or "").lower()
+    matched: Set[str] = set()
+    # Capability discovery wins over creation so "can you make images?" does not
+    # also pull in generate_image via the bare "images" creation keyword.
+    if any(re.search(rf"\b{re.escape(kw)}\b", ql) for kw in _IMAGE_CAPABILITY_HINTS):
+        matched.add("list_media_models")
+    elif any(re.search(rf"\b{re.escape(kw)}\b", ql) for kw in _IMAGE_CREATION_HINTS):
+        matched.update({"list_media_models", "generate_image"})
+    for keywords, tools in ToolIndex._KEYWORD_HINTS.items():
+        if any(re.search(rf"\b{re.escape(kw)}\b", ql) for kw in keywords):
+            matched.update(tools)
+    return matched
 
 
 class ToolIndex:
@@ -492,15 +526,6 @@ class ToolIndex:
         frozenset({"write a", "create a doc", "draft", "compose", "poem", "story",
                    "essay", "outline", "letter"}):
             {"create_document", "edit_document", "update_document"},
-        # Image / media generation discovery + creation intent. Surfaces the
-        # discovery tool alongside generate_image so "can you make images?" /
-        # "what image models are available?" resolve available models instead
-        # of the agent guessing an unconfigured model name.
-        frozenset({"image", "images", "picture", "pictures", "photo", "art",
-                   "illustration", "draw", "render", "make an image",
-                   "generate an image", "create an image", "image model",
-                   "image models", "media models", "make images", "can you make"}):
-            {"list_media_models", "generate_image"},
     }
 
     def get_tools_for_query(
@@ -510,21 +535,13 @@ class ToolIndex:
         base = set(always_include or ALWAYS_AVAILABLE)
         retrieved = self.retrieve(query, k=k)
         base.update(retrieved)
-        # Keyword-based force-include for common intents. Match on word
-        # boundaries, not raw substrings, so short hints like "fix", "line",
-        # "serve", "reply" or "unread" don't fire inside unrelated words
-        # ("prefix", "deadline"/"online", "observe"/"reserve", "replying",
-        # "unreadable"). Same word-boundary matching used in topic_analyzer.
-        ql = query.lower()
-        for keywords, tools in self._KEYWORD_HINTS.items():
-            if any(re.search(rf"\b{re.escape(kw)}\b", ql) for kw in keywords):
-                base.update(tools)
+        base.update(keyword_hint_tools(query))
         # Structural scheduling-intent detection — typo-resilient (the literal
         # keyword "every day" misses "every dya"). Catches "every <word>",
         # daily/nightly/etc., or a clock time like "at 7:30 am" / "7am", which
         # all signal a recurring/scheduled task. Force-include manage_tasks so
         # the agent can actually create the cron job instead of fumbling.
-        if self._SCHEDULE_RE.search(ql):
+        if self._SCHEDULE_RE.search((query or "").lower()):
             base.add("manage_tasks")
         return base
 

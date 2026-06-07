@@ -55,3 +55,32 @@ def test_plain_tell_request_stays_minimal():
     assert not (_EMAIL_TOOLS & tools)
     # Always-available baseline is still there.
     assert set(ALWAYS_AVAILABLE) <= tools
+
+
+# Image capability discovery — must surface list_media_models, never a
+# hallucinated "draw" tool, and must not force generate_image on questions.
+
+_CAPABILITY_QUERIES = (
+    "Can you make images?",
+    "Can you draw?",
+    "Do you support image generation?",
+    "Can you generate pictures?",
+    "What image models are available?",
+)
+
+
+def test_image_capability_queries_surface_list_media_models_only():
+    ti = _index_without_embeddings()
+    for q in _CAPABILITY_QUERIES:
+        tools = ti.get_tools_for_query(q)
+        assert "list_media_models" in tools, q
+        assert "generate_image" not in tools, q
+        assert "draw" not in tools, q
+
+
+def test_image_creation_intent_still_surfaces_generation_tools():
+    ti = _index_without_embeddings()
+    tools = ti.get_tools_for_query("draw a cat in watercolor style")
+    assert "list_media_models" in tools
+    assert "generate_image" in tools
+    assert "draw" not in tools

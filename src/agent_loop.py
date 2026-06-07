@@ -1451,6 +1451,23 @@ def build_active_plan_note(approved_plan: str) -> str:
     )
 
 
+def _list_media_result_is_unavailable(result: object) -> bool:
+    """True when list_media_models reports no usable image model."""
+    if not isinstance(result, dict):
+        return False
+    if result.get("available") is False:
+        return True
+    return result.get("status") in ("no_models", "no_default")
+
+
+def _deterministic_image_creation_answer(tool_result: object) -> Optional[str]:
+    """Return the final assistant text for unconfigured creation pre-routes."""
+    if not _list_media_result_is_unavailable(tool_result):
+        return None
+    text = tool_result.get("results") if isinstance(tool_result, dict) else None
+    return text.strip() if isinstance(text, str) and text.strip() else None
+
+
 async def stream_agent_loop(
     endpoint_url: str,
     model: str,
@@ -1763,6 +1780,7 @@ async def stream_agent_loop(
     # concrete creation prompts call list_media_models before the model can
     # hallucinate draw/image_editing blocks or claim it cannot create images.
     _image_discovery_prerouted = False
+    _image_creation_final_answer: Optional[str] = None
     if (
         not guide_only
         and not plan_mode
@@ -1787,36 +1805,48 @@ async def stream_agent_loop(
                 yield (
                     f'data: {json.dumps({"type": "tool_output", "tool": "list_media_models", "command": "", "output": output_text, "exit_code": 0})}\n\n'
                 )
-                if _preroute_kind == "capability":
-                    preroute_note = (
-                        "## list_media_models (pre-routed)\n"
-                        "The user asked whether image generation is available. "
-                        "This tool ran automatically before your response.\n\n"
-                        f"{formatted}\n\n"
-                        "Answer ONLY from this result. There is no `draw`, `image_editing`, "
-                        "`edit_image`, or other invented image tool — do not call or mention them. "
-                        "If no models are configured, relay the degraded-state message above."
+                _image_discovery_prerouted = True
+                _deterministic_answer = (
+                    _deterministic_image_creation_answer(result)
+                    if _preroute_kind == "creation"
+                    else None
+                )
+                if _deterministic_answer:
+                    _image_creation_final_answer = _deterministic_answer
+                    logger.info(
+                        "[image-discovery] terminating deterministically after list_media_models "
+                        "(creation, no model configured)",
                     )
                 else:
-                    preroute_note = (
-                        "## list_media_models (pre-routed)\n"
-                        "The user asked to generate an image. No image model is configured yet, "
-                        "so this tool ran automatically before your response.\n\n"
-                        f"{formatted}\n\n"
-                        "Image generation IS available as a tool in this app — do NOT say you "
-                        "cannot create images. Relay the degraded-state message and setup "
-                        "guidance above. There is no `draw`, `image_editing`, `edit_image`, "
-                        "Stable Diffusion, sstablediff, or other invented provider/tool — do not "
-                        "call or mention them."
+                    if _preroute_kind == "capability":
+                        preroute_note = (
+                            "## list_media_models (pre-routed)\n"
+                            "The user asked whether image generation is available. "
+                            "This tool ran automatically before your response.\n\n"
+                            f"{formatted}\n\n"
+                            "Answer ONLY from this result. There is no `draw`, `image_editing`, "
+                            "`edit_image`, or other invented image tool — do not call or mention them. "
+                            "If no models are configured, relay the degraded-state message above."
+                        )
+                    else:
+                        preroute_note = (
+                            "## list_media_models (pre-routed)\n"
+                            "The user asked to generate an image. No image model is configured yet, "
+                            "so this tool ran automatically before your response.\n\n"
+                            f"{formatted}\n\n"
+                            "Image generation IS available as a tool in this app — do NOT say you "
+                            "cannot create images. Relay the degraded-state message and setup "
+                            "guidance above. There is no `draw`, `image_editing`, `edit_image`, "
+                            "Stable Diffusion, sstablediff, or other invented provider/tool — do not "
+                            "call or mention them."
+                        )
+                    inject = untrusted_context_message("tool_result", preroute_note)
+                    messages.insert(_index_of_last_user_message(messages), inject)
+                    disabled_tools.update({"generate_image", "edit_image"})
+                    logger.info(
+                        "[image-discovery] pre-routed list_media_models (%s) before model response",
+                        _preroute_kind,
                     )
-                inject = untrusted_context_message("tool_result", preroute_note)
-                messages.insert(_index_of_last_user_message(messages), inject)
-                disabled_tools.update({"generate_image", "edit_image"})
-                _image_discovery_prerouted = True
-                logger.info(
-                    "[image-discovery] pre-routed list_media_models (%s) before model response",
-                    _preroute_kind,
-                )
             except Exception as e:
                 logger.warning("[image-discovery] pre-route failed (non-fatal): %s", e)
 
@@ -1887,7 +1917,25 @@ async def stream_agent_loop(
     # so the user can resume instead of the turn silently stalling.
     _exhausted_rounds = False
 
+    round_reasoning = ""
+
+    if _image_creation_final_answer is not None:
+        time_to_first_token = time.time() - total_start
+        first_token_received = True
+        full_response = _image_creation_final_answer
+        round_texts.append(full_response)
+        tool_events.append({
+            "round": 0,
+            "tool": "list_media_models",
+            "command": "",
+            "output": _image_creation_final_answer,
+            "exit_code": 0,
+        })
+        yield f'data: {json.dumps({"delta": _image_creation_final_answer})}\n\n'
+
     for round_num in range(1, max_rounds + 1):
+        if _image_creation_final_answer is not None:
+            break
         round_response = ""
         round_reasoning = ""  # reasoning_content deltas (DeepSeek-thinking, vLLM --reasoning-parser)
         native_tool_calls = []  # populated if model uses function calling

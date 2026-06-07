@@ -137,7 +137,7 @@ def test_concrete_creation_preroutes_with_no_config():
     assert should_preroute_image_discovery(_CREATION_PROMPT, settings=settings) == "creation"
 
 
-def test_concrete_creation_does_not_preroute_when_media_model_configured():
+def test_concrete_creation_preroutes_generate_image_when_media_model_configured():
     settings = {
         "media_models": [{
             "id": "qwen-image",
@@ -149,7 +149,7 @@ def test_concrete_creation_does_not_preroute_when_media_model_configured():
         "default_image_media_model": "qwen-image",
         "image_model": "",
     }
-    assert should_preroute_image_discovery(_CREATION_PROMPT, settings=settings) is None
+    assert should_preroute_image_discovery(_CREATION_PROMPT, settings=settings) == "configured_creation"
 
 
 def test_concrete_creation_surfaces_generation_route_when_configured():

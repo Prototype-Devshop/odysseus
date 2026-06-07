@@ -168,33 +168,106 @@ def test_capability_preroute_still_calls_model(monkeypatch):
     assert model_called == [True]
 
 
-def test_configured_creation_does_not_preroute(monkeypatch):
+def test_configured_creation_preroutes_generate_image_without_model_call(monkeypatch):
     _patch_loop_basics(monkeypatch)
-    dispatch_called = []
+    model_called = []
+    gen_called = []
 
     async def _fake_stream(*_a, **_k):
-        yield "data: " + json.dumps({"delta": "ok"}) + "\n\n"
+        model_called.append(True)
+        yield "data: " + json.dumps({"delta": "invented local_comfyui_sd_1_5"}) + "\n\n"
         yield "data: [DONE]\n\n"
 
-    async def _fake_dispatch(*_a, **_k):
-        dispatch_called.append(True)
-        return ("list_media_models", _no_model_result())
+    async def _fake_generate(content, session_id=None, owner=None, progress_cb=None):
+        gen_called.append({
+            "content": content,
+            "session_id": session_id,
+            "owner": owner,
+        })
+        return {
+            "results": "Generated image for: a red bicycle",
+            "image_url": "/api/generated-image/abc.png",
+            "image_id": "gid-1",
+            "image_prompt": content,
+            "image_model": "sd15-comfy",
+            "image_size": "1024x1024",
+        }
+
+    async def _fail_dispatch(*_a, **_k):
+        raise AssertionError("configured creation must not call dispatch_ai_tool")
 
     monkeypatch.setattr(al, "stream_llm_with_fallback", _fake_stream, raising=False)
-    monkeypatch.setattr("src.ai_interaction.dispatch_ai_tool", _fake_dispatch, raising=False)
+    monkeypatch.setattr("src.ai_interaction.do_generate_image", _fake_generate, raising=False)
+    monkeypatch.setattr("src.ai_interaction.dispatch_ai_tool", _fail_dispatch, raising=False)
     monkeypatch.setattr(
         "src.tool_index.should_preroute_image_discovery",
-        lambda query, owner="", settings=None: None,
+        lambda query, owner="", settings=None: "configured_creation"
+        if query == _CREATION_PROMPT
+        else None,
         raising=False,
     )
 
-    _collect(
+    chunks = _collect(
         al.stream_agent_loop(
             "http://local.test/v1",
             "local-model",
             [{"role": "user", "content": _CREATION_PROMPT}],
             max_rounds=1,
             relevant_tools={"list_media_models", "generate_image"},
+            session_id="sess-live",
+            owner="alice",
         )
     )
-    assert dispatch_called == []
+    events = _events(chunks)
+    assert model_called == []
+    assert gen_called == [{
+        "content": _CREATION_PROMPT,
+        "session_id": "sess-live",
+        "owner": "alice",
+    }]
+    tool_starts = [e for e in events if e.get("type") == "tool_start"]
+    assert len(tool_starts) == 1
+    assert tool_starts[0]["tool"] == "generate_image"
+    assert not any(e.get("tool") == "list_media_models" for e in tool_starts)
+    tool_outputs = [e for e in events if e.get("type") == "tool_output"]
+    assert tool_outputs[0]["tool"] == "generate_image"
+    assert tool_outputs[0]["image_url"] == "/api/generated-image/abc.png"
+    deltas = "".join(e.get("delta", "") for e in events if "delta" in e)
+    assert "Direct link:" in deltas
+    assert "/api/generated-image/abc.png" in deltas
+    assert "local_comfyui" not in deltas.lower()
+    agent_steps = [e for e in events if e.get("type") == "agent_step"]
+    assert agent_steps and agent_steps[0]["round"] == 1
+    metrics = next(e for e in events if e.get("type") == "metrics")
+    assert metrics["data"]["round_texts"] == [deltas]
+
+
+def test_configured_creation_failure_returns_sanitized_error(monkeypatch):
+    _patch_loop_basics(monkeypatch)
+
+    async def _fake_generate(*_a, **_k):
+        return {"error": "ComfyUI did not finish the image within 300s."}
+
+    monkeypatch.setattr("src.ai_interaction.do_generate_image", _fake_generate, raising=False)
+    monkeypatch.setattr(
+        "src.tool_index.should_preroute_image_discovery",
+        lambda query, owner="", settings=None: "configured_creation"
+        if query == _CREATION_PROMPT
+        else None,
+        raising=False,
+    )
+
+    chunks = _collect(
+        al.stream_agent_loop(
+            "http://local.test/v1",
+            "local-model",
+            [{"role": "user", "content": _CREATION_PROMPT}],
+            max_rounds=1,
+        )
+    )
+    events = _events(chunks)
+    tool_outputs = [e for e in events if e.get("type") == "tool_output"]
+    assert tool_outputs[0]["exit_code"] == 1
+    deltas = "".join(e.get("delta", "") for e in events if "delta" in e)
+    assert "300s" in deltas
+    assert "://" not in deltas

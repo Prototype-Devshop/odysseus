@@ -12,7 +12,7 @@ import json
 import re
 import time
 import logging
-from typing import AsyncGenerator, List, Dict, Optional, Set
+from typing import Any, AsyncGenerator, List, Dict, Optional, Set
 from urllib.parse import urlparse
 
 from src.llm_core import stream_llm, stream_llm_with_fallback, _is_ollama_native_url
@@ -1468,6 +1468,29 @@ def _deterministic_image_creation_answer(tool_result: object) -> Optional[str]:
     return text.strip() if isinstance(text, str) and text.strip() else None
 
 
+def _generate_image_tool_output_text(result: object) -> str:
+    """Build agent-visible tool_output text for a generate_image result."""
+    if not isinstance(result, dict):
+        return "Image generation did not return a result."
+    if result.get("error"):
+        return str(result["error"])[:2000]
+    if result.get("image_url"):
+        prompt = (result.get("image_prompt") or result.get("results") or "")[:100]
+        lines = [f"Generated image for: {prompt}", f"Direct link: {result['image_url']}"]
+        if result.get("image_model"):
+            lines.append(f"model: {result['image_model']}")
+        if result.get("image_size"):
+            lines.append(f"size: {result['image_size']}")
+        return "\n".join(lines)[:4000]
+    text = result.get("results")
+    return text[:4000] if isinstance(text, str) and text.strip() else "Image generation did not return a result."
+
+
+def _deterministic_configured_image_answer(result: object) -> str:
+    """Return the final assistant text for configured creation pre-routes."""
+    return _generate_image_tool_output_text(result)
+
+
 async def stream_agent_loop(
     endpoint_url: str,
     model: str,
@@ -1776,22 +1799,69 @@ async def stream_agent_loop(
     # Strip internal metadata keys before sending to the LLM API
     messages = [{k: v for k, v in msg.items() if k != "_protected"} for msg in messages]
 
-    # Deterministic pre-route: image-capability questions and unconfigured
-    # concrete creation prompts call list_media_models before the model can
-    # hallucinate draw/image_editing blocks or claim it cannot create images.
+    # Deterministic pre-route: image-capability questions, unconfigured creation
+    # (list_media_models + degraded state), and configured creation (canonical
+    # do_generate_image) — so the model cannot invent model-specific pseudo-tools.
     _image_discovery_prerouted = False
     _image_creation_final_answer: Optional[str] = None
+    _image_creation_tool_event: Optional[Dict[str, Any]] = None
     if (
         not guide_only
         and not plan_mode
         and _last_user
         and get_setting("image_gen_enabled", True)
-        and "list_media_models" not in disabled_tools
-        and not (tool_policy and tool_policy.blocks("list_media_models"))
     ):
         from src.tool_index import should_preroute_image_discovery
         _preroute_kind = should_preroute_image_discovery(_last_user, owner=owner or "")
-        if _preroute_kind:
+        if _preroute_kind == "configured_creation":
+            try:
+                from src.ai_interaction import do_generate_image
+
+                _gen_cmd = _last_user.strip()[:80]
+                yield (
+                    f'data: {json.dumps({"type": "tool_start", "tool": "generate_image", "command": _gen_cmd, "round": 0})}\n\n'
+                )
+                result = await do_generate_image(
+                    _last_user.strip(),
+                    session_id=session_id,
+                    owner=owner,
+                )
+                output_text = _generate_image_tool_output_text(result)
+                tool_output_data = {
+                    "type": "tool_output",
+                    "tool": "generate_image",
+                    "command": _gen_cmd,
+                    "output": output_text,
+                    "exit_code": 0 if not (isinstance(result, dict) and result.get("error")) else 1,
+                }
+                if isinstance(result, dict):
+                    for k in ("image_url", "image_prompt", "image_model", "image_size", "image_quality"):
+                        if result.get(k):
+                            tool_output_data[k] = result[k]
+                yield f'data: {json.dumps(tool_output_data)}\n\n'
+                _image_discovery_prerouted = True
+                _image_creation_final_answer = _deterministic_configured_image_answer(result)
+                _image_creation_tool_event = {
+                    "round": 0,
+                    "tool": "generate_image",
+                    "command": _gen_cmd,
+                    "output": output_text,
+                    "exit_code": tool_output_data["exit_code"],
+                }
+                if isinstance(result, dict) and result.get("image_url"):
+                    for ik in ("image_url", "image_prompt", "image_model", "image_size", "image_quality"):
+                        if result.get(ik):
+                            _image_creation_tool_event[ik] = result[ik]
+                logger.info(
+                    "[image-discovery] terminating deterministically after generate_image "
+                    "(configured creation)",
+                )
+            except Exception as e:
+                logger.warning("[image-discovery] configured creation pre-route failed (non-fatal): %s", e)
+        elif _preroute_kind and (
+            "list_media_models" not in disabled_tools
+            and not (tool_policy and tool_policy.blocks("list_media_models"))
+        ):
             try:
                 from src.ai_interaction import dispatch_ai_tool
                 desc, result = await dispatch_ai_tool(
@@ -1924,13 +1994,16 @@ async def stream_agent_loop(
         first_token_received = True
         full_response = _image_creation_final_answer
         round_texts.append(full_response)
-        tool_events.append({
-            "round": 0,
-            "tool": "list_media_models",
-            "command": "",
-            "output": _image_creation_final_answer,
-            "exit_code": 0,
-        })
+        if _image_creation_tool_event is not None:
+            tool_events.append(_image_creation_tool_event)
+        else:
+            tool_events.append({
+                "round": 0,
+                "tool": "list_media_models",
+                "command": "",
+                "output": _image_creation_final_answer,
+                "exit_code": 0,
+            })
         # Frontend hides the initial bubble on tool_start when there is no prose
         # yet; agent_step creates the visible round bubble before text deltas.
         yield f'data: {json.dumps({"type": "agent_step", "round": 1})}\n\n'

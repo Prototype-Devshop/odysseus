@@ -221,10 +221,11 @@ def should_preroute_image_discovery(
     owner: str = "",
     settings: Optional[Dict[str, Any]] = None,
 ) -> Optional[str]:
-    """Return ``'capability'``, ``'creation'``, or ``None`` for pre-routing.
+    """Return a pre-route kind for image discovery / generation, or ``None``.
 
-    Capability questions always pre-route. Concrete creation prompts pre-route
-    only when no media model and no legacy/endpoint fallback is configured.
+    * ``'capability'`` — list_media_models for availability questions
+    * ``'creation'`` — list_media_models + degraded state when unconfigured
+    * ``'configured_creation'`` — canonical ``do_generate_image`` when routable
     """
     if not isinstance(query, str) or not query.strip():
         return None
@@ -233,8 +234,9 @@ def should_preroute_image_discovery(
     if is_concrete_image_creation_prompt(query):
         from src import media_registry
 
-        if not media_registry.image_generation_routable(owner=owner, settings=settings):
-            return "creation"
+        if media_registry.image_generation_routable(owner=owner, settings=settings):
+            return "configured_creation"
+        return "creation"
     return None
 
 

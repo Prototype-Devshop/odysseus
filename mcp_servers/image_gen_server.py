@@ -7,6 +7,7 @@ image providers and media-registry providers such as ComfyUI.
 """
 
 import asyncio
+import logging
 import sys
 from pathlib import Path
 
@@ -16,7 +17,42 @@ from mcp.types import Tool, TextContent
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+logger = logging.getLogger(__name__)
+
+_GENERIC_MCP_ERROR = "Image generation failed unexpectedly. Check local logs for details."
+
 server = Server("image_gen")
+
+
+def _build_image_content(prompt: str, model: str = "", size: str = "", quality: str = "") -> str:
+    """Build the line-oriented payload expected by do_generate_image."""
+    safe_prompt = " ".join((prompt or "").splitlines()).strip()
+    return "\n".join([safe_prompt, model or "", size or "", quality or ""])
+
+
+def _mcp_visible_error(err: str) -> str:
+    """Return err only when safe for MCP/agent output; otherwise generic."""
+    if not err or not isinstance(err, str):
+        return _GENERIC_MCP_ERROR
+    low = err.lower()
+    _LEAK_MARKERS = (
+        "://",
+        "/users/",
+        "\\users\\",
+        "/home/",
+        "api_key",
+        "token",
+        "secret",
+        "bearer ",
+        "sk-",
+    )
+    if any(m in low for m in _LEAK_MARKERS):
+        return _GENERIC_MCP_ERROR
+    if err.startswith("Image generation failed (") and "):" in err:
+        return _GENERIC_MCP_ERROR
+    if err.startswith("Image generation error:"):
+        return _GENERIC_MCP_ERROR
+    return err
 
 
 @server.list_tools()
@@ -70,11 +106,12 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         # single-user local default; revisit before multi-user deployment). The
         # direct chat path (routes/chat_routes.py) DOES pass the real owner and
         # remains owner/session-scoped — do not weaken it.
-        content = "\n".join([prompt, model_spec or "", size or "", quality or ""])
+        content = _build_image_content(prompt, model_spec, size, quality)
         result = await do_generate_image(content, owner=None)
 
         if isinstance(result, dict) and result.get("error"):
-            return [TextContent(type="text", text=f"Error: {result['error']}")]
+            safe = _mcp_visible_error(result["error"])
+            return [TextContent(type="text", text=f"Error: {safe}")]
 
         image_url = result.get("image_url") if isinstance(result, dict) else None
         if image_url:
@@ -90,8 +127,9 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         msg = result.get("results") if isinstance(result, dict) else None
         return [TextContent(type="text", text=msg or "Error: Unexpected image generation response")]
 
-    except Exception as e:
-        return [TextContent(type="text", text=f"Error: {e}")]
+    except Exception:
+        logger.exception("MCP generate_image failed")
+        return [TextContent(type="text", text=f"Error: {_GENERIC_MCP_ERROR}")]
 
 
 async def run():
